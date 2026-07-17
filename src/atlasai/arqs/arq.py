@@ -1,6 +1,5 @@
 import os
-from pathlib import Path
-import sys
+
 from typing import Literal
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field, SecretStr
@@ -12,14 +11,7 @@ from dotenv import load_dotenv
 from langchain_core.tools import tool
 from langchain_core.output_parsers import StrOutputParser
 
-SRC_ROOT = Path(__file__).resolve().parents[2]
-RAG_LESSON_ROOT = SRC_ROOT / "lessons" / "03_rag"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-if str(RAG_LESSON_ROOT) not in sys.path:
-    sys.path.insert(0, str(RAG_LESSON_ROOT))
-
-from src.rag.retrieval import _get_retriever
+from atlasai.rag.retrieval import _get_retriever
 from langchain_core.tools import tool
 
 load_dotenv()

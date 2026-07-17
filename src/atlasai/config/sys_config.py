@@ -1,13 +1,11 @@
 import os
 from typing import TypedDict
 from dotenv import load_dotenv
-from util.utils import load_file
-
+from atlasai.util.utils import load_file
 
 load_dotenv()
 
 SRC_DIR = os.path.dirname(os.path.dirname(__file__))
-
 
 class ModelConfig(TypedDict):
     provider: str
@@ -22,10 +20,10 @@ class SysConfig(TypedDict):
 
 def get_env(_var: str) -> str:
     if _var is None:
-        raise ValueError(f"Fetching empty var!")
+        raise ValueError("Fetching empty var!")
     var = os.getenv(_var)
     if var is None:
-        raise ValueError(f"Env variable {_var} is missing!")
+        raise ValueError("Env variable {_var} is missing!")
     return var
 
 def get_model_config() -> ModelConfig:
