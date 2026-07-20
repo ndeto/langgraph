@@ -1,23 +1,13 @@
-from typing import Any, Literal, TypedDict
-from langchain_core.documents import Document
-
-class GraderResult(TypedDict):
-    res: Literal["generate_node", "research_user_node"]
-    sentiment: str
-
+from typing import Annotated,TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+from langchain_core.tools import BaseTool
 class Context(TypedDict):
     system_prompt: str | None
     soul: str | None
 
 class StateContext(TypedDict, total=False):
+    messages: Annotated[list[BaseMessage], add_messages]
     user_input: str
-    recent_messages: dict[str, str] | None
-    llm_response: str | list[str | dict[Any, Any]]
-    tool_calls: list[dict]
-    final_response: str | None
-    tool_results: list[Document] | None
-    grader_result: GraderResult | None
-    refine_iterations: int
-
-
-
+    available_tools_metadata: list | None
+    resolved_tools: list[BaseTool]

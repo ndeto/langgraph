@@ -16,7 +16,7 @@ class ModelConfig(TypedDict):
 class SysConfig(TypedDict):
     model: ModelConfig
     soul: str | None
-    system_prompt: str | None
+    user_instruction_prompt: str | None
 
 def get_env(_var: str) -> str:
     if _var is None:
@@ -54,9 +54,7 @@ def bootstrap_config() -> SysConfig:
     _sys_prompt = get_sys_prompt()
 
     config = SysConfig(
-        model = _model_config,
-        soul = _soul,
-        system_prompt = _sys_prompt
+        model=_model_config, soul=_soul, user_instruction_prompt=_sys_prompt
     )
 
     return config

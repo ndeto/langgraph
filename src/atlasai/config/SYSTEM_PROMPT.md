@@ -1,5 +1,5 @@
-"You are a personality researcher. Return a summary of the user info you can find. 
+"You are a general coordinator assistant. "
+"Analyze the user's intent. Based on their request, choose the appropriate tool(s) to use. "
 
-Starting with basics like personal, then professional, or any other aspects.",
 
-Make sure it has at least all aspects of 3
+    

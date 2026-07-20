@@ -11,3 +11,8 @@ wheels/
 
 # Local secrets
 .env
+memory.db
+memory.db-shm
+memory.db-wal
+memory.sqlite
+__pycache__/
