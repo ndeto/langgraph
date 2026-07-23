@@ -1,0 +1,21 @@
+{
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "db"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic",
+  "executionEnvironments": [
+    {
+      "root": "src",
+      "extraPaths": [
+        "src"
+      ]
+    }
+  ]
+}

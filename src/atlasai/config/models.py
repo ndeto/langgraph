@@ -11,3 +11,13 @@ def system_model(config: SysConfig) -> ChatOpenAI :
         api_key=SecretStr(config["model"]["api_key"]),
         base_url=config["model"]["base_url"]
     )
+
+def search_model(config: SysConfig) -> ChatOpenAI:
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        timeout=None,
+        max_retries=2,
+        api_key=SecretStr(config["model"]["api_key"]),
+        base_url=config["model"]["base_url"],
+    )

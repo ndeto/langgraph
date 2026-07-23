@@ -1,28 +1,21 @@
-## AtlasAI Learning Repo
+## AtlasAI
 
-This repo is organized as a set of learning steps around agent engineering with LangGraph and LangChain.
+This is a work-in-progress building a self-adapting, self-improving agent with Python, LangGraph, and LangChain.
 
-### Lesson layout
+Context Management: Tool Loadout
+ReAct Enabled
+Persistent Memory
 
-- `src/lessons/01_basics`
-  - `graph.py`
-  - `template.py`
+### Run
 
-- `src/lessons/02_reasoning`
-  - `arq.py`
+Install dependencies:
 
-- `src/lessons/03_rag`
-  - `retrieval.py`
-  - `retrieval.backup.py`
-  - `grader.py`
+```bash
+uv sync
+```
 
-- `src/lessons/04_hybrid`
-  - `hybrid.py`
+Run the current graph harness:
 
-### Shared support code
-
-- `src/config`
-- `src/models.py`
-- `src/session.py`
-- `src/util`
-- `src/llm_node.py`
+```bash
+uv run python -m atlasai.graphs.template
+```

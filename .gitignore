@@ -15,4 +15,12 @@ memory.db
 memory.db-shm
 memory.db-wal
 memory.sqlite
+memory.sqlite-shm
+memory.sqlite-wal
+structured_memory.json
+saved_qa_before_rag.md
+db/
+*.pdf
+.vscode/
 __pycache__/
+internal/
