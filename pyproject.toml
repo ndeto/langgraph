@@ -30,10 +30,15 @@ dependencies = [
     "chroma>=0.2.0",
     "langchain-chroma>=1.1.0",
     "langchain-classic>=1.0.8",
+    "fastapi[standard]>=0.139.2",
+    "langgraph-checkpoint-postgres>=3.1.0",
+    "langchain-postgres>=0.0.17",
+    "langmem>=0.0.30",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.9.1",
     "pyright>=1.1.411",
     "ruff>=0.15.21",
 ]

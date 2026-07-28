@@ -1,15 +1,19 @@
 import json
 from typing import TypedDict
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_unstructured.document_loaders import Element
-from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
-from langchain_core.prompts import PromptTemplate
-from langchain_core.documents import Document
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
-from langchain_classic.retrievers.ensemble import EnsembleRetriever
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_unstructured.document_loaders import Element
+from unstructured.chunking.title import chunk_by_title
+from unstructured.partition.pdf import partition_pdf
+
+from atlasai.config.sys_config import SysConfig, bootstrap_config
+from atlasai.store.rag_retriever import doc_store
+
+config: SysConfig = bootstrap_config()
+
 load_dotenv()
 
 
@@ -153,7 +157,9 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
         content_data = separate_content_types(chunk)
 
         print(f"Types found: {content_data['types']}")
-        print(f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}")
+        print(
+            f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}"
+        )
 
         # Create AI enhanced Summaries
         print("Creating AI enchance summary")
@@ -170,8 +176,6 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
             print("Using raw text, no images and tables found")
             enhanced_content = content_data["text"] or ""
 
-        
-
         doc = Document(
             page_content=enhanced_content or texts or "",
             metadata={
@@ -179,7 +183,6 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
                     {
                         "raw_text": texts or "",
                         "tables_html": tables or [],
-                        "images": images or [],
                     }
                 )
             },
@@ -189,30 +192,27 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
     print(f"Processed {len(langchain_docs)} chunks")
     return langchain_docs
 
-def doc_store(persistent_db="db/chroma.db"):
-
-    vector_store = Chroma(
-        embedding_function=OpenAIEmbeddings(),
-        persist_directory=persistent_db,
-        collection_metadata={"hnsw:space": "cosine"}
-    )
-
-    return vector_store.as_retriever(kwargs={"k": 3})
-
 
 def main():
     docs = ["attention.pdf", "cv.pdf"]
-    doc_retriever = doc_store()
+    print("\n Store Initializing Store \n")
+    storage = doc_store()
+    print("Store Initialized")
 
     for d in docs:
+        print(f"\n Partitioning {d} \n")
         elements = partition_document(d)
+        print(f"\n Chunking {d} \n")
         chunks = create_chunks_by_title(elements)
+        print(f"\n Summarizing {d} \n")
         docs = summarize_chunks(chunks)
 
-        doc_retriever.add_documents(docs)
+        print(f"\n Stored {len(d)} chunks from {d} \n")
+        storage.add_documents(docs)
 
-    res = doc_retriever.invoke("what is the transformer model architecture")
-    return res
+    res = storage.as_retriever().invoke("what is the transformer model architecture")
+    print(res)
 
-if __name__ == "__main__":
-    main()
+
+# if __name__ == "__main__":
+#     main()

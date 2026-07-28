@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ${POSTGRES_CONTAINER_NAME:-atlasai-postgres}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-atlasai}
+      POSTGRES_USER: ${POSTGRES_USER:-atlasai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atlasai}
+    ports:
+      - ${POSTGRES_PORT:-55433}:5432
+    volumes:
+      - atlasai_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-atlasai} -d ${POSTGRES_DB:-atlasai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  atlasai_postgres_data:

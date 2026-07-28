@@ -5,6 +5,8 @@ This is a work-in-progress building a self-adapting, self-improving agent with P
 Context Management: Tool Loadout
 ReAct Enabled
 Persistent Memory
+Production RAG
+Hybrid Search
 
 ### Run
 
