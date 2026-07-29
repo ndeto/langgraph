@@ -1,18 +1,21 @@
+import asyncio
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Protocol
+import tracemalloc
+from typing import Protocol
 
 import requests
 from langchain.messages import HumanMessage, RemoveMessage, SystemMessage, trim_messages
 from langchain.tools import BaseTool, tool
 from langchain_classic.prompts import PromptTemplate
-from langgraph.checkpoint.postgres import PostgresSaver
+from langchain_core.runnables.config import RunnableConfig
+from langchain_postgres import PGVectorStore
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.runtime import Runtime
-from langgraph.store.postgres import PostgresStore
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from langmem import create_manage_memory_tool, create_search_memory_tool
 from pydantic import BaseModel, Field, PrivateAttr
 from tenacity import (
@@ -27,10 +30,12 @@ from atlasai.config.models import search_model, system_model
 from atlasai.config.sys_config import SysConfig
 from atlasai.lib.session import Context, MemoryUpdateResult, StateContext
 from atlasai.rag.utils import build_document_context_prompt
-from atlasai.store import doc_store, tool_store
-from atlasai.store.rag_retriever import get_store
+from atlasai.store import get_or_create_store, tool_store
 from atlasai.tools import math_tools
 from atlasai.util.utils import load_file
+
+if not tracemalloc.is_tracing():
+    tracemalloc.start(25)
 
 
 class InvokePayload(TypedDict):
@@ -39,7 +44,7 @@ class InvokePayload(TypedDict):
 
 
 class GraphRunner(Protocol):
-    def run(self, payload: InvokePayload) -> str: ...
+    async def run(self, payload: InvokePayload) -> str: ...
 
 
 class GraphService(GraphRunner):
@@ -50,40 +55,22 @@ class GraphService(GraphRunner):
     def __init__(self, config: SysConfig) -> None:
         self.sys_config = config
         self.get_crypto_prices = self.CryptoPriceTool(config)
+
+        @tool
+        async def search_user_info(query: str):
+            """This searches available website sources for user information like personal information and biographies for personalities"""
+            store: PGVectorStore = await get_or_create_store("websites")
+            res = await store.asimilarity_search(query)
+
+            return res
+
         self.tools_list = [
-            self.search_user_info,
+            search_user_info,
             self.get_crypto_prices,
             *math_tools,
             create_manage_memory_tool(namespace=("memories")),
             create_search_memory_tool(namespace=("memories")),
         ]
-
-    @tool
-    def search_user_info(self, query: str):
-        """This searches available website sources for user information like personal information and biographies for personalities"""
-        retriever = get_store("websites").as_retriever()
-        res = retriever.invoke(query)
-
-        json_results = []
-        for r in res:
-            json_results.append(json.dumps(r))
-
-        return json_results
-
-    @tool
-    def offloaded_context_memory_search(self, queries: list[str]):
-        """Retrieve stored long-term memory and past conversation context about the user or current thread. Use this when the answer depends on prior discussions, remembered preferences, personal background, ongoing work, or previously established context."""
-
-        offloaded_context = load_file("structured_memory.json")
-
-        matches = []
-
-        for item in offloaded_context:
-            text = json.dumps(item)
-            if any(query.lower() in text for query in queries):
-                matches.append(item)
-
-        return matches
 
     class PriceInput(BaseModel):
         ticker: str = Field(description="The ticker for the price we are fetching")
@@ -111,7 +98,7 @@ class GraphService(GraphRunner):
             if not self.validate_schema(ticker):
                 return ValueError("Schema not Valid")
 
-            # Call
+            # Request the current USD price from CoinGecko.
             coin_gecko_url = f"https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids={ticker}&x_cg_demo_api_key={self._config['cg_api_key']}"
             res = requests.get(coin_gecko_url)
             res.raise_for_status()
@@ -119,10 +106,7 @@ class GraphService(GraphRunner):
             return res.json()
 
         def validate_schema(self, ticker: str) -> bool:
-            if ticker is None:
-                return False
-
-            return True
+            return ticker is not None
 
     def retrieve_tools(self, tool_names: list[str]):
         tools = []
@@ -134,7 +118,7 @@ class GraphService(GraphRunner):
         return tools
 
     def tool_resolver_node(self, state: StateContext):
-        # Tool Loadout
+        # Select the tools most relevant to the current request.
         tools = []
         if "user_input" in state:
             query = state["user_input"]
@@ -151,7 +135,7 @@ class GraphService(GraphRunner):
 
         return {"resolved_tools": tools}
 
-    def agent_llm_node(self, state: StateContext, runtime: Runtime[Context]):
+    async def agent_llm_node(self, state: StateContext, runtime: Runtime[Context]):
         context = runtime.context or {
             "user_instruction_prompt": self.sys_config["user_instruction_prompt"],
             "soul": self.sys_config["soul"],
@@ -166,8 +150,8 @@ class GraphService(GraphRunner):
         system_instruction = f"Available Tools: {state.get('resolved_tools')}"
         user_input = state.get("user_input") or ""
 
-        rag_store = doc_store().as_retriever()
-        rag_res = rag_store.invoke(user_input)
+        rag_store = await get_or_create_store("raggidy_docs")
+        rag_res = await rag_store.asimilarity_search(user_input)
 
         rag_context = build_document_context_prompt(
             user_input, rag_res, "knowledge-base"
@@ -194,13 +178,9 @@ class GraphService(GraphRunner):
             max_tokens=1000000,
             strategy="last",
             token_counter="approximate",
-            # Most chat models expect that chat history starts with either:
-            # (1) a HumanMessage or
-            # (2) a SystemMessage followed by a HumanMessage
+            # Start history with a human message, optionally preceded by a system message.
             start_on="human",
-            # Usually, we want to keep the SystemMessage
-            # if it's present in the original history.
-            # The SystemMessage has special instructions for the model.
+            # Preserve system instructions while trimming older conversation turns.
             include_system=True,
             allow_partial=False,
         )
@@ -331,62 +311,82 @@ class GraphService(GraphRunner):
 
         return mem_graph
 
-    def build_graph_config(self, thread_id: str, run_name: str) -> dict[str, Any]:
-        config: dict[str, Any] = {
+    def build_graph_config(self, thread_id: str, run_name: str):
+        config: RunnableConfig = {
             "configurable": {"thread_id": thread_id},
             "run_name": run_name,
         }
 
         return config
 
-    def run_main_graph(self, graph, thread_id, state: StateContext):
-        return graph.invoke(
+    async def run_main_graph(self, graph, thread_id, state: StateContext):
+        res = await graph.ainvoke(
             state,
             config=self.build_graph_config(thread_id, "atlasai-main-graph"),
         )
 
-    def run_memory_graph(self, graph, thread_id, state):
-        return graph.invoke(
-            state,
-            config=self.build_graph_config(thread_id, "atlasai-memory-graph"),
-        )
+        return res
 
-    def run(self, payload: InvokePayload):
+    async def run_memory_graph(self, thread_id, state):
+        memory_graph = self.build_memory_graph()
+
+        async with (
+            AsyncPostgresSaver.from_conn_string(
+                self.sys_config["pg_store"]
+            ) as checkpointer,
+            AsyncPostgresStore.from_conn_string(
+                self.sys_config["pg_store"]
+            ) as postgres_store,
+        ):
+            await checkpointer.setup()
+            await postgres_store.setup()
+            graph = memory_graph.compile(
+                checkpointer=checkpointer, store=postgres_store
+            )
+            return await graph.ainvoke(
+                state,
+                config=self.build_graph_config(thread_id, "atlasai-memory-graph"),
+            )
+
+    def _log_background_task(self, task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except Exception as exc:
+            print(f"Background memory graph failed: {exc}")
+
+    async def run(self, payload: InvokePayload) -> str:
         query = payload.get("user_input")
 
         main_graph = self.build_main_graph()
-        memory_graph = self.build_memory_graph()
-        memory_executor = ThreadPoolExecutor(max_workers=1)
 
-        with PostgresSaver.from_conn_string(self.sys_config["db_conn"]) as checkpointer:
-            with PostgresStore.from_conn_string(
+        async with (
+            AsyncPostgresSaver.from_conn_string(
                 self.sys_config["pg_store"]
-            ) as postgres_store:
-                checkpointer.setup()
-                postgres_store.setup()
-                try:
-                    current_state: StateContext = {
-                        "user_input": query,
-                        "messages": [HumanMessage(content=query)],
-                    }
-                    thread_id = payload.get("thread_id")
-                    graph = main_graph.compile(
-                        checkpointer=checkpointer, store=postgres_store
-                    )
-                    final_state = self.run_main_graph(graph, thread_id, current_state)
+            ) as checkpointer,
+            AsyncPostgresStore.from_conn_string(
+                self.sys_config["pg_store"]
+            ) as postgres_store,
+        ):
+            await checkpointer.setup()
+            await postgres_store.setup()
+            try:
+                current_state: StateContext = {
+                    "user_input": query,
+                    "messages": [HumanMessage(content=query)],
+                }
+                thread_id = payload.get("thread_id")
+                graph = main_graph.compile(
+                    checkpointer=checkpointer, store=postgres_store
+                )
+                final_state = await self.run_main_graph(graph, thread_id, current_state)
 
-                    mem_graph = memory_graph.compile(
-                        checkpointer=checkpointer, store=postgres_store
-                    )
+                memory_task = asyncio.create_task(
+                    self.run_memory_graph(thread_id, final_state)
+                )
+                memory_task.add_done_callback(self._log_background_task)
 
-                    memory_executor.submit(
-                        self.run_memory_graph, mem_graph, thread_id, final_state
-                    )
+                return final_state["messages"][-1].content
 
-                    return final_state["messages"][-1].content
-
-                except Exception as e:
-                    print(e)
-                    raise
-                finally:
-                    memory_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception as e:
+                print(e)
+                raise

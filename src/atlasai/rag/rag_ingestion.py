@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import TypedDict
 
@@ -5,12 +6,14 @@ from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
+from langchain_postgres import PGVectorStore
 from langchain_unstructured.document_loaders import Element
 from unstructured.chunking.title import chunk_by_title
 from unstructured.partition.pdf import partition_pdf
 
 from atlasai.config.sys_config import SysConfig, bootstrap_config
-from atlasai.store.rag_retriever import doc_store
+from atlasai.rag.image_payloads import persist_base64_image
+from atlasai.store.hybrid_store import get_or_create_store
 
 config: SysConfig = bootstrap_config()
 
@@ -86,7 +89,9 @@ def separate_content_types(chunk: Element) -> ContentData:
 
             if element_type == "Image":
                 content_data["types"].append("image")
-                content_data["images"].append(element.metadata.image_base64)
+                image_path = persist_base64_image(element.metadata.image_base64)
+                if image_path:
+                    content_data["images"].append(image_path)
 
     content_data["types"] = list(set(content_data["types"]))
     return content_data
@@ -117,6 +122,10 @@ def create_ai_enhanced_content(content_data: ContentData):
     for i, table in enumerate(tables):
         table_prompt += f"Table {i + 1}: {table} \n"
 
+    image_prompt = "\n IMAGES: \n"
+    for i, image_path in enumerate(images):
+        image_prompt += f"Image {i + 1}: {image_path} \n"
+
     table_prompt += """
             YOUR TASK:
             Generate a comprehensive, searchable description that covers:
@@ -136,7 +145,7 @@ def create_ai_enhanced_content(content_data: ContentData):
     res = summarizer.invoke(
         {
             "text_prompt": text_prompt,
-            "table_prompt": table_prompt,
+            "table_prompt": table_prompt + image_prompt,
         }
     )
 
@@ -165,7 +174,7 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
         print("Creating AI enchance summary")
         tables = content_data.get("tables")
         images = content_data.get("images")
-        texts = content_data.get("text")
+        texts = content_data.get("text") or ""
         if tables or images:
             try:
                 enhanced_content = create_ai_enhanced_content(content_data)
@@ -177,12 +186,13 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
             enhanced_content = content_data["text"] or ""
 
         doc = Document(
-            page_content=enhanced_content or texts or "",
+            page_content=enhanced_content or texts,
             metadata={
                 "original_content": json.dumps(
                     {
                         "raw_text": texts or "",
                         "tables_html": tables or [],
+                        "image_paths": images or [],
                     }
                 )
             },
@@ -193,10 +203,10 @@ def summarize_chunks(chunks: list[Element]) -> list[Document]:
     return langchain_docs
 
 
-def main():
+async def main():
     docs = ["attention.pdf", "cv.pdf"]
     print("\n Store Initializing Store \n")
-    storage = doc_store()
+    storage: PGVectorStore = await get_or_create_store("raggidy_docs")
     print("Store Initialized")
 
     for d in docs:
@@ -208,11 +218,8 @@ def main():
         docs = summarize_chunks(chunks)
 
         print(f"\n Stored {len(d)} chunks from {d} \n")
-        storage.add_documents(docs)
-
-    res = storage.as_retriever().invoke("what is the transformer model architecture")
-    print(res)
+        await storage.aadd_documents(docs)
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -4,7 +4,7 @@ from unittest import TestCase
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from atlasai.service.graph import GraphRunner
+from atlasai.service.graph_service import GraphRunner
 from atlasai.web.main import create_app
 
 

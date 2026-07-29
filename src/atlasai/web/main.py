@@ -5,7 +5,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import PlainTextResponse
 
 from atlasai.config.sys_config import SysConfig, bootstrap_config
-from atlasai.service.graph import GraphRunner, GraphService, InvokePayload
+from atlasai.service.graph_service import GraphRunner, GraphService, InvokePayload
 
 sys_config: SysConfig = bootstrap_config()
 
@@ -25,11 +25,11 @@ def create_app(graph_service: GraphRunner) -> FastAPI:
         return {"Hello": "World"}
 
     @app.post("/invoke", response_class=PlainTextResponse)
-    def _(
+    async def _(
         input: InvokePayload,
         graph_service: Annotated[GraphRunner, Depends(get_graph_service)],
     ):
-        res = graph_service.run(input)
+        res = await graph_service.run(input)
         return res
 
     return app

@@ -1,16 +1,18 @@
-from pydoc import doc
+import asyncio
 
+from langchain_postgres import PGVectorStore
 from langchain_unstructured import UnstructuredLoader
-from atlasai.store.rag_retriever import get_store
+
+from atlasai.store.hybrid_store import get_or_create_store
 
 
 class WebsiteRAG:
-    def __init__(self, websites: list[str]) -> None:
+    def __init__(self, websites: list[str], store: PGVectorStore):
         self.websites = websites
-        self.store = get_store("websites")
+        self.store: PGVectorStore = store
         print(f"\n Initilized with {websites}! \n")
 
-    def rag_sites(self):
+    async def rag_sites(self):
         for l in self.websites:
             print(f"Ragging {l} \n")
             docs = UnstructuredLoader(
@@ -24,16 +26,20 @@ class WebsiteRAG:
 
             print(f"{len(docs)} docs found for {l} \n")
 
-            self.store.add_documents(docs)
+            await self.store.aadd_documents(docs)
 
             print(f"Done for {l}\n")
 
 
-def main():
+async def main():
     links = ["https://ndeto.eth.limo"]
 
-    ragger = WebsiteRAG(websites=links)
-    ragger.rag_sites()
+    store = await get_or_create_store("websites")
 
-# if __name__ == "__main__":
-#     main()
+    ragger = WebsiteRAG(websites=links, store=store)
+    
+    await ragger.rag_sites()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
