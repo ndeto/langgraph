@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import tracemalloc
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 import requests
@@ -44,7 +45,7 @@ class InvokePayload(TypedDict):
 
 
 class GraphRunner(Protocol):
-    async def run(self, payload: InvokePayload) -> str: ...
+    def stream(self, payload: InvokePayload) -> AsyncIterator[object]: ...
 
 
 class GraphService(GraphRunner):
@@ -191,7 +192,15 @@ class GraphService(GraphRunner):
 
         llm = system_model(self.sys_config)
 
-        response = llm.bind_tools(tools).invoke(trimmed_messages)
+        llm_status = "[Atlas AI] LLM is working..."
+        print(llm_status, flush=True)
+        runtime.stream_writer({"type": "status", "data": llm_status})
+        response = await llm.bind_tools(tools).ainvoke(trimmed_messages)
+
+        for tool_call in response.tool_calls:
+            tool_status = f"[Atlas AI] Calling tool: {tool_call['name']}"
+            print(tool_status, flush=True)
+            runtime.stream_writer({"type": "status", "data": tool_status})
 
         return {"messages": [response]}
 
@@ -319,14 +328,6 @@ class GraphService(GraphRunner):
 
         return config
 
-    async def run_main_graph(self, graph, thread_id, state: StateContext):
-        res = await graph.ainvoke(
-            state,
-            config=self.build_graph_config(thread_id, "atlasai-main-graph"),
-        )
-
-        return res
-
     async def run_memory_graph(self, thread_id, state):
         memory_graph = self.build_memory_graph()
 
@@ -354,7 +355,25 @@ class GraphService(GraphRunner):
         except Exception as exc:
             print(f"Background memory graph failed: {exc}")
 
-    async def run(self, payload: InvokePayload) -> str:
+    @staticmethod
+    def _message_chunk_text(message: object) -> str:
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content
+
+        if not isinstance(content, list):
+            return ""
+
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+
+        return "".join(text_parts)
+
+    async def stream(self, payload: InvokePayload) -> AsyncIterator[object]:
         query = payload.get("user_input")
 
         main_graph = self.build_main_graph()
@@ -378,14 +397,36 @@ class GraphService(GraphRunner):
                 graph = main_graph.compile(
                     checkpointer=checkpointer, store=postgres_store
                 )
-                final_state = await self.run_main_graph(graph, thread_id, current_state)
+                last_state: StateContext | None = None
 
-                memory_task = asyncio.create_task(
-                    self.run_memory_graph(thread_id, final_state)
-                )
-                memory_task.add_done_callback(self._log_background_task)
+                async for chunk in graph.astream(
+                    current_state,
+                    config=self.build_graph_config(thread_id, "atlas-main"),
+                    version="v2",
+                    stream_mode=["custom", "messages", "values"],
+                ):
+                    if chunk["type"] == "values":
+                        last_state = chunk["data"]
+                    elif chunk["type"] == "custom":
+                        status = chunk["data"]
+                        if isinstance(status, dict) and status.get("type") == "status":
+                            yield status
+                    elif chunk["type"] == "messages":
+                        message, metadata = chunk["data"]
+                        if metadata.get("langgraph_node") != "agent":
+                            continue
 
-                return final_state["messages"][-1].content
+                        token = self._message_chunk_text(message)
+                        if token:
+                            yield {"type": "token", "data": token}
+
+                if last_state is not None:
+                    yield {"type": "final", "data": last_state}
+
+                    memory_task = asyncio.create_task(
+                        self.run_memory_graph(thread_id, last_state)
+                    )
+                    memory_task.add_done_callback(self._log_background_task)
 
             except Exception as e:
                 print(e)

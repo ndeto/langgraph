@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Atlas AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=Manrope:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <button
+        id="panel-toggle"
+        class="panel-toggle"
+        type="button"
+        aria-controls="rag-panel"
+        aria-expanded="false"
+      >
+        Panel
+      </button>
+
+      <main class="hero">
+        <div class="hero-mark" aria-hidden="true"></div>
+        <p class="eyebrow">Portfolio Agent UI</p>
+        <h1>Atlas AI</h1>
+        <p class="subtitle">A calm shell for future chat, retrieval, and document workflows.</p>
+
+        <section class="composer" aria-label="Chat composer shell">
+          <label class="sr-only" for="chat-input">Message Atlas AI</label>
+          <textarea
+            id="chat-input"
+            class="chat-input"
+            rows="3"
+            placeholder="Ask Atlas AI anything..."
+            data-role="chat-input"
+          ></textarea>
+          <div class="composer-meta">
+            <span class="composer-chip">Chat shell</span>
+            <span class="composer-hint">Press Enter later</span>
+          </div>
+        </section>
+
+        <div class="attachment-row">
+          <input id="pdf-input" type="file" accept=".pdf,application/pdf" hidden />
+          <button id="attachment-button" class="attachment-button" type="button">
+            Attach PDF
+          </button>
+        </div>
+      </main>
+
+      <aside id="rag-panel" class="rag-panel" aria-hidden="true">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">RAG Side Panel</p>
+            <h2>Document Intake</h2>
+          </div>
+          <button id="panel-close" class="panel-close" type="button" aria-label="Close panel">
+            Close
+          </button>
+        </div>
+
+        <section class="panel-card">
+          <p class="panel-label">Selected file</p>
+          <p id="selected-file" class="panel-value">No document selected</p>
+        </section>
+
+        <section class="panel-card stats-grid">
+          <div class="stat">
+            <p class="panel-label">Elements</p>
+            <p id="elements-count" class="panel-value">-</p>
+          </div>
+          <div class="stat">
+            <p class="panel-label">Chunks</p>
+            <p id="chunks-count" class="panel-value">-</p>
+          </div>
+          <div class="stat">
+            <p class="panel-label">Docs</p>
+            <p id="docs-count" class="panel-value">-</p>
+          </div>
+        </section>
+
+        <section class="panel-card">
+          <p class="panel-label">Logs</p>
+          <div id="processing-logs" class="logs-box" data-role="log-output">
+            Processing logs will appear here.
+          </div>
+        </section>
+      </aside>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
