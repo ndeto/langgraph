@@ -1,16 +1,14 @@
 # AtlasAI
 
-Disclaimer: This is not a vibecoded project. The goal is to build a functional, production-leaning agent with carefully engineered memory, retrieval, and reasoning workflows.
+Disclaimer: AtlasAI's LangGraph, Python, FastAPI, retrieval, and memory backend was engineered manually. AI assistance was used only for the frontend UI scaffold.
 
 AtlasAI is a production-leaning AI agent built with FastAPI, LangGraph, LangChain, and Postgres. It is meant to show applied agent engineering work:
 
-- graph-based orchestration instead of a single prompt wrapper
+- graph-based orchestration
 - real retrieval infrastructure with Postgres hybrid search
 - memory management beyond short chat history
 - ingestion pipelines for both documents and websites
 - an HTTP service layer that can evolve into a deployable backend
-
-It is intentionally hands-on and infrastructure-aware, which makes it a good portfolio piece for LLM application engineering, agent systems, and retrieval-heavy backend work.
 
 
 The project focuses on a practical agent architecture. It combines tool use, hybrid retrieval, long-term memory, and advanced document ingestion into one system that can be invoked over HTTP.
@@ -20,7 +18,7 @@ The project focuses on a practical agent architecture. It combines tool use, hyb
 - Runs a LangGraph-based conversational agent behind a FastAPI API.
 - Uses hybrid retrieval with `PGVectorStore` on Postgres and `pgvector`.
 - Supports advanced document RAG with PDF partitioning, chunking, summarization, and metadata preservation.
-- Ingests website content into a searchable store for profile and biography lookups.
+- Ingests indexed website content into a searchable store for profile and biography lookups.
 - Maintains long-term conversational memory with LangMem and a background memory update flow.
 - Persists graph state with a Postgres checkpointer for thread-aware conversations.
 
@@ -105,18 +103,16 @@ PGVECTOR_CONNECTION=postgresql+psycopg://atlasai:atlasai@localhost:55433/atlasai
 
 ## Running
 
-Start the API:
+Start the app:
 
 ```bash
 uv run fastapi dev src/atlasai/web/main.py
 ```
 
-Example request:
+Then open the UI in your browser:
 
-```bash
-curl -X POST http://127.0.0.1:8000/invoke \
-  -H "Content-Type: application/json" \
-  -d '{"user_input":"Who is Ndeto?","thread_id":"demo-thread"}'
+```text
+http://127.0.0.1:8000
 ```
 
 ## Ingestion Workflows
@@ -132,4 +128,3 @@ Load website content into the website store:
 ```bash
 uv run python -m atlasai.rag.website
 ```
-

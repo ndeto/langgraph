@@ -1,10 +1,10 @@
-from logging import Logger
+import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI
-from fastapi.responses import FileResponse
-from fastapi.responses import StreamingResponse
+from fastapi.concurrency import asynccontextmanager
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from atlasai.config.sys_config import SysConfig, bootstrap_config
@@ -16,15 +16,11 @@ STATIC_DIR = WEB_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 
-def get_logger_service() -> Logger:
-    return Logger(name="atlas-logger")
-
-
 def create_app(graph_service: GraphRunner) -> FastAPI:
     def get_graph_service() -> GraphRunner:
         return graph_service
 
-    app = FastAPI(title="Atlas Agent Web API")
+    app = FastAPI(title="Atlas Agent Web API", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/")
@@ -36,24 +32,37 @@ def create_app(graph_service: GraphRunner) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/invoke")
-    async def _(
+    def _(
         input: InvokePayload,
         graph_service: Annotated[GraphRunner, Depends(get_graph_service)],
+        stream_format: Literal["text", "ndjson"] = "text",
     ):
         async def response_stream():
             async for chunk in graph_service.stream(input):
                 if chunk.get("type") == "status":
                     status = chunk.get("data")
                     if isinstance(status, str):
-                        yield f"{status}\n"
+                        if stream_format == "ndjson":
+                            yield (
+                                json.dumps({"type": "status", "text": status}) + "\n"
+                            )
+                        else:
+                            yield f"{status}\n"
                 elif chunk.get("type") == "token":
                     token = chunk.get("data")
                     if isinstance(token, str):
-                        yield token
+                        if stream_format == "ndjson":
+                            yield (json.dumps({"type": "token", "text": token}) + "\n")
+                        else:
+                            yield token
+                elif chunk.get("type") == "final" and stream_format == "ndjson":
+                    yield json.dumps({"type": "done"}) + "\n"
 
         return StreamingResponse(
             response_stream(),
-            media_type="text/plain",
+            media_type=(
+                "application/x-ndjson" if stream_format == "ndjson" else "text/plain"
+            ),
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
@@ -62,6 +71,13 @@ def create_app(graph_service: GraphRunner) -> FastAPI:
 
     return app
 
-
 graph_service = GraphService(config=sys_config)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await graph_service.startup()
+    app.state.graph_service = graph_service
+    yield
+    await graph_service.shutdown()
+
 app = create_app(graph_service)

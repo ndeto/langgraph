@@ -45,7 +45,10 @@ class InvokePayload(TypedDict):
 
 
 class GraphRunner(Protocol):
-    def stream(self, payload: InvokePayload) -> AsyncIterator[object]: ...
+    def stream(
+        self,
+        payload: InvokePayload,
+    ) -> AsyncIterator[object]: ...
 
 
 class GraphService(GraphRunner):
@@ -56,10 +59,17 @@ class GraphService(GraphRunner):
     def __init__(self, config: SysConfig) -> None:
         self.sys_config = config
         self.get_crypto_prices = self.CryptoPriceTool(config)
+        self.tool_retriever = tool_store(self.tools_list).as_retriever(
+            search_kwargs={"k": 5}
+        )
+        self.checkpointer = None
+        self.store = None
+        self.graph = None
+        self.memory_graph = None
 
         @tool
         async def search_user_info(query: str):
-            """This searches available website sources for user information like personal information and biographies for personalities"""
+            """Search indexed websites for a named person's biography or professional details. Use for questions like 'Who is X?' or 'What does X do?'"""
             store: PGVectorStore = await get_or_create_store("websites")
             res = await store.asimilarity_search(query)
 
@@ -72,6 +82,34 @@ class GraphService(GraphRunner):
             create_manage_memory_tool(namespace=("memories")),
             create_search_memory_tool(namespace=("memories")),
         ]
+        self._tools_by_name = {tool.name: tool for tool in self.tools_list}
+
+    async def startup(self):
+        self.pg_store_cm = AsyncPostgresStore.from_conn_string(
+            self.sys_config["pg_store"]
+        )
+        self.checkpointer_cm = AsyncPostgresSaver.from_conn_string(
+            self.sys_config["pg_store"]
+        )
+
+        self.checkpointer = await self.checkpointer_cm.__aenter__()
+        self.pg_store = await self.pg_store_cm.__aenter__()
+
+        await self.checkpointer.setup()
+        await self.pg_store.setup()
+
+        self.graph = self.build_main_graph().compile(
+            checkpointer=self.checkpointer, store=self.store
+        )
+        self.memory_graph = self.build_memory_graph().compile(
+            checkpointer=self.checkpointer, store=self.store
+        )
+
+    async def shutdown(self):
+        if self.pg_store_cm is not None:
+            await self.pg_store_cm.__aexit__(None, None, None)
+        if self.checkpointer_cm is not None:
+            await self.checkpointer_cm.__aexit__(None, None, None)
 
     class PriceInput(BaseModel):
         ticker: str = Field(description="The ticker for the price we are fetching")
@@ -110,31 +148,31 @@ class GraphService(GraphRunner):
             return ticker is not None
 
     def retrieve_tools(self, tool_names: list[str]):
-        tools = []
-        for t in self.tools_list:
-            for tool_name in tool_names:
-                if t.name == tool_name:
-                    tools.append(t)
+        return [
+            self._tools_by_name[tool_name]
+            for tool_name in dict.fromkeys(tool_names)
+            if tool_name in self._tools_by_name
+        ]
 
-        return tools
+    async def tool_resolver_node(self, state: StateContext, runtime: Runtime[Context]):
+        query = state.get("user_input")
+        if not query:
+            return {"resolved_tools": []}
 
-    def tool_resolver_node(self, state: StateContext):
-        # Select the tools most relevant to the current request.
-        tools = []
-        if "user_input" in state:
-            query = state["user_input"]
-            tool_retriever = tool_store(self.tools_list).as_retriever(
-                search_kwargs={"k": 5}
+        status = "[Atlas AI] Selecting tools..."
+        print(status, flush=True)
+        runtime.stream_writer({"type": "status", "data": status})
+
+        matched_tools = self.tool_retriever.invoke(query)
+        tool_names = list(
+            dict.fromkeys(
+                tool.metadata["name"]
+                for tool in matched_tools
+                if tool.metadata.get("name") in self._tools_by_name
             )
+        )
 
-            matched_tools = tool_retriever.invoke(query)
-
-            for tool in matched_tools:
-                for t in self.tools_list:
-                    if tool.metadata["name"] == t.name:
-                        tools.append(t.name)
-
-        return {"resolved_tools": tools}
+        return {"resolved_tools": tool_names}
 
     async def agent_llm_node(self, state: StateContext, runtime: Runtime[Context]):
         context = runtime.context or {
@@ -187,7 +225,6 @@ class GraphService(GraphRunner):
         )
 
         tools_list: list[str] = state.get("resolved_tools") or []
-
         tools: list[BaseTool] = self.retrieve_tools(tools_list)
 
         llm = system_model(self.sys_config)
@@ -329,25 +366,10 @@ class GraphService(GraphRunner):
         return config
 
     async def run_memory_graph(self, thread_id, state):
-        memory_graph = self.build_memory_graph()
-
-        async with (
-            AsyncPostgresSaver.from_conn_string(
-                self.sys_config["pg_store"]
-            ) as checkpointer,
-            AsyncPostgresStore.from_conn_string(
-                self.sys_config["pg_store"]
-            ) as postgres_store,
-        ):
-            await checkpointer.setup()
-            await postgres_store.setup()
-            graph = memory_graph.compile(
-                checkpointer=checkpointer, store=postgres_store
-            )
-            return await graph.ainvoke(
-                state,
-                config=self.build_graph_config(thread_id, "atlasai-memory-graph"),
-            )
+        return await self.memory_graph.ainvoke(
+            state,
+            config=self.build_graph_config(thread_id, "atlasai-memory-graph"),
+        )
 
     def _log_background_task(self, task: asyncio.Task) -> None:
         try:
@@ -373,61 +395,49 @@ class GraphService(GraphRunner):
 
         return "".join(text_parts)
 
-    async def stream(self, payload: InvokePayload) -> AsyncIterator[object]:
+    async def stream(
+        self,
+        payload: InvokePayload,
+    ) -> AsyncIterator[object]:
         query = payload.get("user_input")
+        try:
+            current_state: StateContext = {
+                "user_input": query,
+                "messages": [HumanMessage(content=query)],
+            }
+            thread_id = payload.get("thread_id")
 
-        main_graph = self.build_main_graph()
+            last_state: StateContext | None = None
 
-        async with (
-            AsyncPostgresSaver.from_conn_string(
-                self.sys_config["pg_store"]
-            ) as checkpointer,
-            AsyncPostgresStore.from_conn_string(
-                self.sys_config["pg_store"]
-            ) as postgres_store,
-        ):
-            await checkpointer.setup()
-            await postgres_store.setup()
-            try:
-                current_state: StateContext = {
-                    "user_input": query,
-                    "messages": [HumanMessage(content=query)],
-                }
-                thread_id = payload.get("thread_id")
-                graph = main_graph.compile(
-                    checkpointer=checkpointer, store=postgres_store
+            async for chunk in self.graph.astream(
+                current_state,
+                config=self.build_graph_config(thread_id, "atlas-main"),
+                version="v2",
+                stream_mode=["custom", "messages", "values"],
+            ):
+                if chunk["type"] == "values":
+                    last_state = chunk["data"]
+                elif chunk["type"] == "custom":
+                    status = chunk["data"]
+                    if isinstance(status, dict) and status.get("type") == "status":
+                        yield status
+                elif chunk["type"] == "messages":
+                    message, metadata = chunk["data"]
+                    if metadata.get("langgraph_node") != "agent":
+                        continue
+
+                    token = self._message_chunk_text(message)
+                    if token:
+                        yield {"type": "token", "data": token}
+
+            if last_state is not None:
+                yield {"type": "final", "data": last_state}
+
+                memory_task = asyncio.create_task(
+                    self.run_memory_graph(thread_id, last_state)
                 )
-                last_state: StateContext | None = None
+                memory_task.add_done_callback(self._log_background_task)
 
-                async for chunk in graph.astream(
-                    current_state,
-                    config=self.build_graph_config(thread_id, "atlas-main"),
-                    version="v2",
-                    stream_mode=["custom", "messages", "values"],
-                ):
-                    if chunk["type"] == "values":
-                        last_state = chunk["data"]
-                    elif chunk["type"] == "custom":
-                        status = chunk["data"]
-                        if isinstance(status, dict) and status.get("type") == "status":
-                            yield status
-                    elif chunk["type"] == "messages":
-                        message, metadata = chunk["data"]
-                        if metadata.get("langgraph_node") != "agent":
-                            continue
-
-                        token = self._message_chunk_text(message)
-                        if token:
-                            yield {"type": "token", "data": token}
-
-                if last_state is not None:
-                    yield {"type": "final", "data": last_state}
-
-                    memory_task = asyncio.create_task(
-                        self.run_memory_graph(thread_id, last_state)
-                    )
-                    memory_task.add_done_callback(self._log_background_task)
-
-            except Exception as e:
-                print(e)
-                raise
+        except Exception as e:
+            print(e)
+            raise

@@ -1,5 +1,6 @@
 import unittest
 from collections.abc import AsyncIterator
+import json
 from unittest import TestCase
 
 from fastapi import FastAPI
@@ -63,6 +64,27 @@ class TestWeb(TestCase):
             "[Atlas AI] LLM is working...\n"
             "[Atlas AI] Calling tool: fake_tool\n"
             "fake assistant response",
+        )
+
+    def test_invoke_ndjson(self):
+        res = client.post(
+            "invoke?stream_format=ndjson",
+            json={"user_input": "Hello", "thread_id": "test-thread"},
+        )
+
+        events = [json.loads(line) for line in res.text.splitlines()]
+
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("application/x-ndjson", res.headers["content-type"])
+        self.assertEqual(
+            events,
+            [
+                {"type": "status", "text": "[Atlas AI] LLM is working..."},
+                {"type": "status", "text": "[Atlas AI] Calling tool: fake_tool"},
+                {"type": "token", "text": "fake "},
+                {"type": "token", "text": "assistant response"},
+                {"type": "done"},
+            ],
         )
 
 

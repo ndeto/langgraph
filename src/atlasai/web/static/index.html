@@ -14,6 +14,10 @@
   </head>
   <body>
     <div class="app-shell">
+      <button id="new-thread" class="new-thread" type="button">
+        New thread
+      </button>
+
       <button
         id="panel-toggle"
         class="panel-toggle"
@@ -24,26 +28,43 @@
         Panel
       </button>
 
-      <main class="hero">
-        <div class="hero-mark" aria-hidden="true"></div>
-        <p class="eyebrow">Portfolio Agent UI</p>
-        <h1>Atlas AI</h1>
-        <p class="subtitle">A calm shell for future chat, retrieval, and document workflows.</p>
+      <main id="chat-view" class="hero">
+        <header class="hero-intro">
+          <div class="hero-mark" aria-hidden="true"></div>
+          <div>
+            <p class="eyebrow">Retrieval, memory, and reasoning</p>
+            <h1>Atlas AI</h1>
+            <p class="subtitle">Ask a question and watch the agent work.</p>
+          </div>
+        </header>
 
-        <section class="composer" aria-label="Chat composer shell">
+        <section
+          id="chat-messages"
+          class="chat-messages"
+          aria-live="polite"
+          aria-label="Conversation"
+          hidden
+        ></section>
+
+        <form id="chat-form" class="composer" aria-label="Chat composer">
           <label class="sr-only" for="chat-input">Message Atlas AI</label>
           <textarea
             id="chat-input"
             class="chat-input"
-            rows="3"
+            rows="2"
             placeholder="Ask Atlas AI anything..."
             data-role="chat-input"
           ></textarea>
           <div class="composer-meta">
-            <span class="composer-chip">Chat shell</span>
-            <span class="composer-hint">Press Enter later</span>
+            <span id="thread-label" class="composer-chip">New conversation</span>
+            <div class="composer-actions">
+              <span class="composer-hint">Enter to send / Shift+Enter for a line</span>
+              <button id="send-button" class="send-button" type="submit">
+                Send
+              </button>
+            </div>
           </div>
-        </section>
+        </form>
 
         <div class="attachment-row">
           <input id="pdf-input" type="file" accept=".pdf,application/pdf" hidden />
@@ -93,6 +114,7 @@
       </aside>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
