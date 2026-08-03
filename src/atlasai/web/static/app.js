@@ -12,12 +12,18 @@ const chatInput = document.getElementById("chat-input");
 const sendButton = document.getElementById("send-button");
 const newThreadButton = document.getElementById("new-thread");
 const threadLabel = document.getElementById("thread-label");
+const elementsCount = document.getElementById("elements-count");
+const chunksCount = document.getElementById("chunks-count");
+const docsCount = document.getElementById("docs-count");
 const markdownRenderer = globalThis.markdownit
   ? globalThis.markdownit({ html: false, linkify: true, breaks: true })
   : null;
+const MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024;
+const PDF_MIME_TYPES = new Set(["application/pdf"]);
 
 let threadId = createThreadId();
 let activeController = null;
+let activeUploadController = null;
 let isStreaming = false;
 let scrollFrame = null;
 
@@ -44,6 +50,12 @@ function setStreaming(nextValue) {
   isStreaming = nextValue;
   sendButton.disabled = nextValue;
   sendButton.textContent = nextValue ? "Working" : "Send";
+}
+
+function setUploadStreaming(nextValue) {
+  attachmentButton.disabled = nextValue;
+  attachmentButton.textContent = nextValue ? "Uploading..." : "Attach PDF";
+  pdfInput.disabled = nextValue;
 }
 
 function scrollConversation() {
@@ -112,6 +124,33 @@ function addStatus(text) {
 
 function statusMessage(text) {
   return text.replace(/^\[Atlas AI\]\s*/, "");
+}
+
+function setPanelStats({ elements, chunks, docs }) {
+  elementsCount.textContent = elements ?? "-";
+  chunksCount.textContent = chunks ?? "-";
+  docsCount.textContent = docs ?? "-";
+}
+
+function resetIngestionPanel() {
+  selectedFile.textContent = "No document selected";
+  setPanelStats({ elements: "-", chunks: "-", docs: "-" });
+  processingLogs.textContent = "Processing logs will appear here.";
+}
+
+function appendProcessingLog(text) {
+  const nextLine = String(text || "").trim();
+  if (!nextLine) {
+    return;
+  }
+
+  if (processingLogs.textContent === "Processing logs will appear here.") {
+    processingLogs.textContent = nextLine;
+  } else {
+    processingLogs.textContent += `\n${nextLine}`;
+  }
+
+  processingLogs.scrollTop = processingLogs.scrollHeight;
 }
 
 async function consumeNdjson(response, onEvent) {
@@ -225,6 +264,16 @@ async function submitMessage(userInput) {
 
         assistantText += event.text;
         scheduleAssistantRender();
+        return;
+      }
+
+      if (event.type === "rag_images") {
+        if (!assistantContent) {
+          assistantContent = addMessage("assistant");
+        }
+
+        assistantText += event.markdown || "";
+        scheduleAssistantRender();
       }
     });
 
@@ -245,6 +294,99 @@ async function submitMessage(userInput) {
       activeController = null;
       setStreaming(false);
       chatInput.focus();
+    }
+  }
+}
+
+async function readErrorMessage(response) {
+  try {
+    const payload = await response.json();
+    if (typeof payload?.detail === "string") {
+      return payload.detail;
+    }
+  } catch {}
+
+  return `Upload failed with status ${response.status}.`;
+}
+
+function isPdfFile(file) {
+  return (
+    PDF_MIME_TYPES.has(file.type) ||
+    file.name.toLowerCase().endsWith(".pdf")
+  );
+}
+
+async function uploadPdf(file) {
+  activeUploadController?.abort();
+  const requestController = new AbortController();
+  activeUploadController = requestController;
+
+  setPanelOpen(true);
+  selectedFile.textContent = `${file.name} (${Math.ceil(file.size / 1024)} KB)`;
+  setPanelStats({ elements: "-", chunks: "-", docs: "-" });
+  processingLogs.textContent = "Starting upload...";
+  setUploadStreaming(true);
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const response = await fetch("/ingest/pdf?stream_format=ndjson", {
+      method: "POST",
+      headers: {
+        Accept: "application/x-ndjson",
+      },
+      body: formData,
+      signal: requestController.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(await readErrorMessage(response));
+    }
+
+    await consumeNdjson(response, (event) => {
+      if (event.type === "file") {
+        selectedFile.textContent = event.file_name || file.name;
+        return;
+      }
+
+      if (event.type === "stats") {
+        setPanelStats({
+          elements: event.elements,
+          chunks: event.chunks,
+          docs: event.docs,
+        });
+        return;
+      }
+
+      if (event.type === "log") {
+        appendProcessingLog(event.text);
+        return;
+      }
+
+      if (event.type === "error") {
+        appendProcessingLog(`Error: ${event.text}`);
+        return;
+      }
+
+      if (event.type === "done") {
+        setPanelStats({
+          elements: event.elements,
+          chunks: event.chunks,
+          docs: event.docs,
+        });
+        appendProcessingLog(event.text || "Ingestion complete");
+      }
+    });
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      appendProcessingLog(`Error: ${error.message}`);
+    }
+  } finally {
+    if (activeUploadController === requestController) {
+      activeUploadController = null;
+      setUploadStreaming(false);
+      pdfInput.value = "";
     }
   }
 }
@@ -281,14 +423,27 @@ pdfInput.addEventListener("change", () => {
   setPanelOpen(true);
 
   if (!file) {
-    selectedFile.textContent = "No document selected";
-    processingLogs.textContent = "Processing logs will appear here.";
+    resetIngestionPanel();
     return;
   }
 
-  selectedFile.textContent = file.name;
-  processingLogs.textContent =
-    "Upload wiring is intentionally deferred.\nThis panel is ready for future PDF ingestion events.";
+  if (!isPdfFile(file)) {
+    selectedFile.textContent = file.name;
+    setPanelStats({ elements: "-", chunks: "-", docs: "-" });
+    processingLogs.textContent = "Only PDF files are supported.";
+    pdfInput.value = "";
+    return;
+  }
+
+  if (file.size > MAX_UPLOAD_SIZE_BYTES) {
+    selectedFile.textContent = file.name;
+    setPanelStats({ elements: "-", chunks: "-", docs: "-" });
+    processingLogs.textContent = "PDF exceeds the 25 MB upload limit.";
+    pdfInput.value = "";
+    return;
+  }
+
+  uploadPdf(file);
 });
 
 chatForm.addEventListener("submit", (event) => {
@@ -313,3 +468,4 @@ chatInput.addEventListener("keydown", (event) => {
 newThreadButton.addEventListener("click", startNewThread);
 
 updateThreadLabel();
+resetIngestionPanel();

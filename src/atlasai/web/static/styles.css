@@ -431,6 +431,15 @@ h1 {
   text-underline-offset: 3px;
 }
 
+.message-assistant .message-content img {
+  display: block;
+  max-width: min(100%, 560px);
+  margin: 1rem 0;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28);
+}
+
 .message-assistant .message-content strong {
   color: #fff8ee;
 }

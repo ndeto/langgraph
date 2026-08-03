@@ -1,7 +1,8 @@
+import json
 import unittest
 from collections.abc import AsyncIterator
-import json
 from unittest import TestCase
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -84,6 +85,59 @@ class TestWeb(TestCase):
                 {"type": "token", "text": "fake "},
                 {"type": "token", "text": "assistant response"},
                 {"type": "done"},
+            ],
+        )
+
+    def test_ingest_pdf_rejects_non_pdf_uploads(self):
+        res = client.post(
+            "/ingest/pdf",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json(), {"detail": "Only PDF uploads are supported."})
+
+    def test_ingest_pdf_streams_ingestion_events(self):
+        async def fake_stream_ingest_pdf(*_, **__):
+            yield {"type": "file", "file_name": "sample.pdf"}
+            yield {"type": "log", "text": "Preparing ingestion for sample.pdf"}
+            yield {"type": "stats", "elements": 8, "chunks": 3, "docs": 2}
+            yield {
+                "type": "done",
+                "text": "Ingestion complete",
+                "file_name": "sample.pdf",
+                "elements": 8,
+                "chunks": 3,
+                "docs": 2,
+            }
+
+        with patch(
+            "atlasai.web.main.stream_ingest_pdf",
+            fake_stream_ingest_pdf,
+        ):
+            res = client.post(
+                "/ingest/pdf?stream_format=ndjson",
+                files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
+            )
+
+        events = [json.loads(line) for line in res.text.splitlines()]
+
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("application/x-ndjson", res.headers["content-type"])
+        self.assertEqual(
+            events,
+            [
+                {"type": "file", "file_name": "sample.pdf"},
+                {"type": "log", "text": "Preparing ingestion for sample.pdf"},
+                {"type": "stats", "elements": 8, "chunks": 3, "docs": 2},
+                {
+                    "type": "done",
+                    "text": "Ingestion complete",
+                    "file_name": "sample.pdf",
+                    "elements": 8,
+                    "chunks": 3,
+                    "docs": 2,
+                },
             ],
         )
 

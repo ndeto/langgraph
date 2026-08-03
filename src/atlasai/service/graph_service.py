@@ -30,7 +30,10 @@ from typing_extensions import TypedDict
 from atlasai.config.models import search_model, system_model
 from atlasai.config.sys_config import SysConfig
 from atlasai.lib.session import Context, MemoryUpdateResult, StateContext
-from atlasai.rag.utils import build_document_context_prompt
+from atlasai.rag.utils import (
+    build_document_context_prompt,
+    build_retrieved_image_markdown,
+)
 from atlasai.store import get_or_create_store, tool_store
 from atlasai.tools import math_tools
 from atlasai.util.utils import load_file
@@ -45,6 +48,8 @@ class InvokePayload(TypedDict):
 
 
 class GraphRunner(Protocol):
+    """Streaming interface for graph-based request execution."""
+
     def stream(
         self,
         payload: InvokePayload,
@@ -52,6 +57,8 @@ class GraphRunner(Protocol):
 
 
 class GraphService(GraphRunner):
+    """Orchestrates graph execution, tool access, and persistence lifecycle."""
+
     sys_config: SysConfig
     tools_list: list[BaseTool] = []
     get_crypto_prices: BaseTool
@@ -85,15 +92,17 @@ class GraphService(GraphRunner):
         self._tools_by_name = {tool.name: tool for tool in self.tools_list}
 
     async def startup(self):
-        self.pg_store_cm = AsyncPostgresStore.from_conn_string(
+        """Open Postgres resources, initialize storage, and compile graphs."""
+
+        self.pg_store_ctx = AsyncPostgresStore.from_conn_string(
             self.sys_config["pg_store"]
         )
-        self.checkpointer_cm = AsyncPostgresSaver.from_conn_string(
+        self.checkpointer_ctx = AsyncPostgresSaver.from_conn_string(
             self.sys_config["pg_store"]
         )
 
-        self.checkpointer = await self.checkpointer_cm.__aenter__()
-        self.pg_store = await self.pg_store_cm.__aenter__()
+        self.checkpointer = await self.checkpointer_ctx.__aenter__()
+        self.pg_store = await self.pg_store_ctx.__aenter__()
 
         await self.checkpointer.setup()
         await self.pg_store.setup()
@@ -106,10 +115,12 @@ class GraphService(GraphRunner):
         )
 
     async def shutdown(self):
-        if self.pg_store_cm is not None:
-            await self.pg_store_cm.__aexit__(None, None, None)
-        if self.checkpointer_cm is not None:
-            await self.checkpointer_cm.__aexit__(None, None, None)
+        """Close Postgres resource context managers."""
+
+        if self.pg_store_ctx is not None:
+            await self.pg_store_ctx.__aexit__(None, None, None)
+        if self.checkpointer_ctx is not None:
+            await self.checkpointer_ctx.__aexit__(None, None, None)
 
     class PriceInput(BaseModel):
         ticker: str = Field(description="The ticker for the price we are fetching")
@@ -195,6 +206,7 @@ class GraphService(GraphRunner):
         rag_context = build_document_context_prompt(
             user_input, rag_res, "knowledge-base"
         )
+        rag_image_markdown = build_retrieved_image_markdown(rag_res)
 
         history = state.get("messages") or []
         system_context = "\n\n".join(
@@ -239,7 +251,10 @@ class GraphService(GraphRunner):
             print(tool_status, flush=True)
             runtime.stream_writer({"type": "status", "data": tool_status})
 
-        return {"messages": [response]}
+        return {
+            "messages": [response],
+            "rag_image_markdown": rag_image_markdown or None,
+        }
 
     def prune_messages_node(self, state: StateContext):
         messages = state.get("messages") or []
@@ -379,6 +394,8 @@ class GraphService(GraphRunner):
 
     @staticmethod
     def _message_chunk_text(message: object) -> str:
+        """Extract plain text from a streamed LangChain message chunk."""
+
         content = getattr(message, "content", "")
         if isinstance(content, str):
             return content
@@ -415,6 +432,7 @@ class GraphService(GraphRunner):
                 version="v2",
                 stream_mode=["custom", "messages", "values"],
             ):
+                # Full graph state after a step
                 if chunk["type"] == "values":
                     last_state = chunk["data"]
                 elif chunk["type"] == "custom":
@@ -422,6 +440,7 @@ class GraphService(GraphRunner):
                     if isinstance(status, dict) and status.get("type") == "status":
                         yield status
                 elif chunk["type"] == "messages":
+                    # Stream Node Status
                     message, metadata = chunk["data"]
                     if metadata.get("langgraph_node") != "agent":
                         continue
@@ -431,6 +450,10 @@ class GraphService(GraphRunner):
                         yield {"type": "token", "data": token}
 
             if last_state is not None:
+                rag_image_markdown = last_state.get("rag_image_markdown")
+                if isinstance(rag_image_markdown, str) and rag_image_markdown.strip():
+                    yield {"type": "rag_images", "data": rag_image_markdown}
+
                 yield {"type": "final", "data": last_state}
 
                 memory_task = asyncio.create_task(

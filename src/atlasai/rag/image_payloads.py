@@ -1,9 +1,16 @@
 import base64
 import binascii
+import mimetypes
 import uuid
 from pathlib import Path
 
 IMAGE_OUTPUT_DIR = Path("tmp/extracted_images")
+
+
+def build_data_url(mime_type: str, payload: bytes) -> str:
+    """Encode bytes as a base64 data URL."""
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def persist_base64_image(
@@ -23,3 +30,16 @@ def persist_base64_image(
 
     image_path.write_bytes(image_bytes)
     return str(image_path)
+
+
+def image_file_to_data_url(image_path: str | Path) -> str | None:
+    """Read an image from disk and return a base64 data URL."""
+    path = Path(image_path)
+    if not path.exists() or not path.is_file():
+        return None
+
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if not mime_type:
+        mime_type = "image/png"
+
+    return build_data_url(mime_type, path.read_bytes())

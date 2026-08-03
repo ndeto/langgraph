@@ -1,6 +1,8 @@
 import asyncio
 import json
-from typing import TypedDict
+from collections.abc import AsyncIterator, Callable
+from pathlib import Path
+from typing import Any, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -20,24 +22,78 @@ config: SysConfig = bootstrap_config()
 load_dotenv()
 
 
-def partition_document(path: str):
+class IngestionEvent(TypedDict, total=False):
+    type: str
+    text: str
+    file_name: str
+    elements: int
+    chunks: int
+    docs: int
+    current: int
+    total: int
+
+
+def build_ingestion_event(
+    event_type: str,
+    text: str | None = None,
+    **extra: Any,
+) -> IngestionEvent:
+    event: IngestionEvent = {"type": event_type, **extra}
+    if text is not None:
+        event["text"] = text
+    return event
+
+
+def emit_log(logger: Callable[[IngestionEvent], None] | None, text: str) -> None:
+    print(text)
+    if logger is not None:
+        logger(build_ingestion_event("log", text=text))
+
+
+def emit_stats(
+    logger: Callable[[IngestionEvent], None] | None,
+    *,
+    file_name: str,
+    elements: int,
+    chunks: int,
+    docs: int,
+) -> None:
+    if logger is not None:
+        logger(
+            build_ingestion_event(
+                "stats",
+                file_name=file_name,
+                elements=elements,
+                chunks=chunks,
+                docs=docs,
+            )
+        )
+
+
+def partition_pdf_doc(
+    path: str | Path,
+    logger: Callable[[IngestionEvent], None] | None = None,
+):
     """Partitions the document"""
-    print("Partitioning Document")
+    emit_log(logger, "Partitioning document")
     elements = partition_pdf(
-        filename=path,
+        filename=str(path),
         strategy="hi_res",
         infer_table_structure=True,
         extract_image_block_types=["Image"],
         extract_image_block_to_payload=True,
     )
 
-    print(f"Found {len(elements)} elements")
+    emit_log(logger, f"Found {len(elements)} elements")
     return elements
 
 
-def create_chunks_by_title(elements: list[Element]):
+def create_chunks_by_title(
+    elements: list[Element],
+    logger: Callable[[IngestionEvent], None] | None = None,
+):
     """Create Intelligent chunks"""
-    print("Creating smart chunks")
+    emit_log(logger, "Creating smart chunks")
     chunks = chunk_by_title(
         elements=elements,
         max_characters=3000,
@@ -45,7 +101,7 @@ def create_chunks_by_title(elements: list[Element]):
         combine_text_under_n_chars=500,
     )
 
-    print(f"Created {len(chunks)} chunks!")
+    emit_log(logger, f"Created {len(chunks)} chunks")
     return chunks
 
 
@@ -152,73 +208,182 @@ def create_ai_enhanced_content(content_data: ContentData):
     return res.content
 
 
-def summarize_chunks(chunks: list[Element]) -> list[Document]:
+def summarize_chunk(
+    chunk: Element,
+    *,
+    current_chunk: int,
+    total_chunks: int,
+    logger: Callable[[IngestionEvent], None] | None = None,
+) -> Document:
+    emit_log(logger, f"Summarizing chunk {current_chunk}/{total_chunks}")
+
+    content_data = separate_content_types(chunk)
+
+    emit_log(logger, f"Types found: {content_data['types']}")
+    emit_log(
+        logger,
+        f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}",
+    )
+
+    emit_log(logger, "Creating AI enhance summary")
+    tables = content_data.get("tables")
+    images = content_data.get("images")
+    texts = content_data.get("text") or ""
+    if tables or images:
+        try:
+            enhanced_content = create_ai_enhanced_content(content_data)
+        except Exception as e:
+            emit_log(logger, f"AI summary failed: {e}")
+            enhanced_content = content_data.get("text")
+    else:
+        emit_log(logger, "Using raw text, no images and tables found")
+        enhanced_content = content_data["text"] or ""
+
+    return Document(
+        page_content=enhanced_content or texts,
+        metadata={
+            "original_content": json.dumps(
+                {
+                    "raw_text": texts or "",
+                    "tables_html": tables or [],
+                    "image_paths": images or [],
+                }
+            )
+        },
+    )
+
+
+def summarize_chunks(
+    chunks: list[Element],
+    logger: Callable[[IngestionEvent], None] | None = None,
+) -> list[Document]:
     """Process all chunks"""
-    print("Processing Chunks")
+    emit_log(logger, "Processing chunks")
 
     langchain_docs = []
     total_chunks = len(chunks)
 
     for i, chunk in enumerate(chunks):
         current_chunk = i + 1
-        print(f"Summarizing chunk {current_chunk}/{total_chunks}")
-
-        content_data = separate_content_types(chunk)
-
-        print(f"Types found: {content_data['types']}")
-        print(
-            f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}"
+        langchain_docs.append(
+            summarize_chunk(
+                chunk,
+                current_chunk=current_chunk,
+                total_chunks=total_chunks,
+                logger=logger,
+            )
         )
 
-        # Create AI enhanced Summaries
-        print("Creating AI enchance summary")
-        tables = content_data.get("tables")
-        images = content_data.get("images")
-        texts = content_data.get("text") or ""
-        if tables or images:
-            try:
-                enhanced_content = create_ai_enhanced_content(content_data)
-            except Exception as e:
-                print(f"AI Summary failed: {e}")
-                enhanced_content = content_data.get("text")
-        else:
-            print("Using raw text, no images and tables found")
-            enhanced_content = content_data["text"] or ""
-
-        doc = Document(
-            page_content=enhanced_content or texts,
-            metadata={
-                "original_content": json.dumps(
-                    {
-                        "raw_text": texts or "",
-                        "tables_html": tables or [],
-                        "image_paths": images or [],
-                    }
-                )
-            },
-        )
-
-        langchain_docs.append(doc)
-    print(f"Processed {len(langchain_docs)} chunks")
+    emit_log(logger, f"Processed {len(langchain_docs)} chunks")
     return langchain_docs
+
+
+async def stream_ingest_pdf(
+    path: str | Path,
+    *,
+    file_name: str | None = None,
+    store_name: str = "raggidy_docs",
+) -> AsyncIterator[IngestionEvent]:
+    resolved_path = Path(path)
+    resolved_name = file_name or resolved_path.name
+    event_queue: list[IngestionEvent] = []
+
+    def logger(event: IngestionEvent) -> None:
+        event_queue.append(event)
+
+    yield build_ingestion_event(
+        "file",
+        file_name=resolved_name,
+        elements=0,
+        chunks=0,
+        docs=0,
+    )
+    emit_log(logger, f"Preparing ingestion for {resolved_name}")
+    emit_log(logger, f"Initializing store: {store_name}")
+    storage: PGVectorStore = await get_or_create_store(store_name)
+    emit_log(logger, "Store initialized")
+
+    while event_queue:
+        yield event_queue.pop(0)
+
+    elements = partition_pdf_doc(resolved_path, logger=logger)
+    emit_stats(
+        logger,
+        file_name=resolved_name,
+        elements=len(elements),
+        chunks=0,
+        docs=0,
+    )
+    while event_queue:
+        yield event_queue.pop(0)
+
+    await asyncio.sleep(0)
+
+    chunks = create_chunks_by_title(elements, logger=logger)
+    emit_stats(
+        logger,
+        file_name=resolved_name,
+        elements=len(elements),
+        chunks=len(chunks),
+        docs=0,
+    )
+    while event_queue:
+        yield event_queue.pop(0)
+
+    await asyncio.sleep(0)
+
+    total_chunks = len(chunks)
+    docs: list[Document] = []
+    for index, chunk in enumerate(chunks, start=1):
+        emit_log(logger, f"Processing chunk {index} of {total_chunks}")
+        docs.append(
+            summarize_chunk(
+                chunk,
+                current_chunk=index,
+                total_chunks=total_chunks,
+                logger=logger,
+            )
+        )
+        emit_stats(
+            logger,
+            file_name=resolved_name,
+            elements=len(elements),
+            chunks=len(chunks),
+            docs=len(docs),
+        )
+        while event_queue:
+            yield event_queue.pop(0)
+        await asyncio.sleep(0)
+
+    emit_log(logger, f"Storing {len(docs)} docs in {store_name}")
+    await storage.aadd_documents(docs)
+    emit_log(logger, f"Ingestion complete for {resolved_name}")
+    emit_stats(
+        logger,
+        file_name=resolved_name,
+        elements=len(elements),
+        chunks=len(chunks),
+        docs=len(docs),
+    )
+    while event_queue:
+        yield event_queue.pop(0)
+
+    yield build_ingestion_event(
+        "done",
+        text="Ingestion complete",
+        file_name=resolved_name,
+        elements=len(elements),
+        chunks=len(chunks),
+        docs=len(docs),
+    )
 
 
 async def main():
     docs = ["attention.pdf", "cv.pdf"]
-    print("\n Store Initializing Store \n")
-    storage: PGVectorStore = await get_or_create_store("raggidy_docs")
-    print("Store Initialized")
 
     for d in docs:
-        print(f"\n Partitioning {d} \n")
-        elements = partition_document(d)
-        print(f"\n Chunking {d} \n")
-        chunks = create_chunks_by_title(elements)
-        print(f"\n Summarizing {d} \n")
-        docs = summarize_chunks(chunks)
-
-        print(f"\n Stored {len(d)} chunks from {d} \n")
-        await storage.aadd_documents(docs)
+        async for _ in stream_ingest_pdf(d, file_name=d):
+            pass
 
 
 if __name__ == "__main__":
