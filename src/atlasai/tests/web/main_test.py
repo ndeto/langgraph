@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import unittest
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
@@ -9,11 +11,17 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from atlasai.application.quotas import QuotaSnapshot
+from atlasai.application.quotas import BucketQuotaSnapshot
 from atlasai.application.usage import UsageRecord
 from atlasai.infrastructure.postgres_repositories import (
     build_in_memory_repository_bundle,
 )
+from atlasai.infrastructure.worker import (
+    WorkerSettings,
+    process_next_cleanup_job,
+    process_next_ingestion_job,
+)
+from atlasai.rag.image_payloads import IMAGE_OUTPUT_DIR
 from atlasai.service.contracts import GraphRunner
 from atlasai.web.main import create_app
 from atlasai.web.streaming import extract_usage_payload
@@ -29,6 +37,10 @@ class FakeVectorService:
     @staticmethod
     def get_store(_table_name: str):
         return None
+
+    async def adelete_by_user(self, *, table_name: str, user_id: str) -> None:
+        self.deleted = getattr(self, "deleted", [])
+        self.deleted.append((table_name, user_id))
 
 
 class FakeGraphService(GraphRunner):
@@ -68,6 +80,17 @@ class ErrorGraphService(GraphRunner):
     async def stream(self, _) -> AsyncIterator[object]:
         yield {"type": "status", "data": "Starting"}
         raise RuntimeError("boom")
+
+
+class RagImagesGraphService(GraphRunner):
+    async def stream(self, _) -> AsyncIterator[object]:
+        yield {"type": "token", "data": "Answer text"}
+        yield {
+            "type": "rag_images",
+            "data": "\n\n### Related Images (Depends on quality of document uploaded)\n\n"
+            "![Related image 1](data:image/png;base64,ZmFrZQ==)",
+        }
+        yield {"type": "final", "data": {"messages": []}}
 
 
 class CapturePayloadGraphService(GraphRunner):
@@ -132,7 +155,16 @@ class TestWeb(TestCase):
         self.assertEqual((res.status_code, res.json()), (200, {"status": "ok"}))
 
     def test_session_creates_cookie_and_defaults(self):
-        res = client.get("/api/v1/session")
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        res = test_client.get(
+            "/api/v1/session",
+            headers={"x-atlas-client-key": "browser-session-default"},
+        )
 
         self.assertEqual(res.status_code, 200)
         self.assertIn("set-cookie", res.headers)
@@ -170,9 +202,9 @@ class TestWeb(TestCase):
         user_id = first_response.json()["user_id"]
         cookie_value = first_response.cookies.get("atlas_demo_session")
 
-        app.state.repositories.quotas.set_snapshot(
-            user_id=user_id,
-            snapshot=QuotaSnapshot(questions_used=4, uploads_used=1),
+        app.state.repositories.quotas.set_client_snapshot(
+            client_key="anonymous-browser",
+            snapshot=BucketQuotaSnapshot(questions_used=4, uploads_used=1),
         )
         app.state.repositories.usage.append_record(
             user_id=user_id,
@@ -209,9 +241,9 @@ class TestWeb(TestCase):
         first_response = test_client.get("/api/v1/session")
         user_id = first_response.json()["user_id"]
 
-        app.state.repositories.quotas.set_snapshot(
-            user_id=user_id,
-            snapshot=QuotaSnapshot(questions_used=10),
+        app.state.repositories.quotas.set_client_snapshot(
+            client_key="anonymous-browser",
+            snapshot=BucketQuotaSnapshot(questions_used=10),
         )
 
         res = test_client.post(
@@ -220,7 +252,13 @@ class TestWeb(TestCase):
         )
 
         self.assertEqual(res.status_code, 429)
-        self.assertEqual(res.json(), {"detail": "Question quota exceeded."})
+        self.assertEqual(
+            res.json(),
+            {
+                "detail": "Question quota reached for this browser session.",
+                "code": "browser_question_quota_reached",
+            },
+        )
         self.assertIn("x-trace-id", res.headers)
 
     def test_ingest_pdf_rejects_when_upload_quota_is_exhausted(self):
@@ -233,9 +271,9 @@ class TestWeb(TestCase):
         first_response = test_client.get("/api/v1/session")
         user_id = first_response.json()["user_id"]
 
-        app.state.repositories.quotas.set_snapshot(
-            user_id=user_id,
-            snapshot=QuotaSnapshot(uploads_used=2),
+        app.state.repositories.quotas.set_client_snapshot(
+            client_key="anonymous-browser",
+            snapshot=BucketQuotaSnapshot(uploads_used=2),
         )
 
         res = test_client.post(
@@ -244,7 +282,13 @@ class TestWeb(TestCase):
         )
 
         self.assertEqual(res.status_code, 429)
-        self.assertEqual(res.json(), {"detail": "Upload quota exceeded."})
+        self.assertEqual(
+            res.json(),
+            {
+                "detail": "Upload quota reached for this browser session.",
+                "code": "browser_upload_quota_reached",
+            },
+        )
         self.assertIn("x-trace-id", res.headers)
 
     def test_invoke_rejects_when_request_key_question_quota_is_exhausted(self):
@@ -261,14 +305,14 @@ class TestWeb(TestCase):
         first_client.get("/api/v1/session")
         first = first_client.post(
             "/invoke",
-            headers={"x-atlas-request-key": "hash-1"},
+            headers={"x-atlas-client-key": "browser-1"},
             json={"user_input": "Hello", "thread_id": "thread-1"},
         )
 
         second_client.get("/api/v1/session")
         second = second_client.post(
             "/invoke",
-            headers={"x-atlas-request-key": "hash-1"},
+            headers={"x-atlas-client-key": "browser-2"},
             json={"user_input": "Hello again", "thread_id": "thread-2"},
         )
 
@@ -276,7 +320,10 @@ class TestWeb(TestCase):
         self.assertEqual(second.status_code, 429)
         self.assertEqual(
             second.json(),
-            {"detail": "Question quota exceeded for this request key."},
+            {
+                "detail": "Question quota reached for this network.",
+                "code": "network_question_quota_reached",
+            },
         )
 
     def test_ingest_pdf_rejects_when_request_key_upload_quota_is_exhausted(self):
@@ -300,14 +347,14 @@ class TestWeb(TestCase):
             first_client.get("/api/v1/session")
             first = first_client.post(
                 "/ingest/pdf",
-                headers={"x-atlas-request-key": "hash-1"},
+                headers={"x-atlas-client-key": "browser-1"},
                 files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
             )
 
             second_client.get("/api/v1/session")
             second = second_client.post(
                 "/ingest/pdf",
-                headers={"x-atlas-request-key": "hash-1"},
+                headers={"x-atlas-client-key": "browser-2"},
                 files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
             )
 
@@ -315,7 +362,10 @@ class TestWeb(TestCase):
         self.assertEqual(second.status_code, 429)
         self.assertEqual(
             second.json(),
-            {"detail": "Upload quota exceeded for this request key."},
+            {
+                "detail": "Upload quota reached for this network.",
+                "code": "network_upload_quota_reached",
+            },
         )
 
     def test_static_assets(self):
@@ -358,6 +408,13 @@ class TestWeb(TestCase):
                 {"type": "status", "text": "[Atlas AI] Calling tool: fake_tool"},
                 {"type": "token", "text": "fake "},
                 {"type": "token", "text": "assistant response"},
+                {
+                    "type": "usage",
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "total_tokens": None,
+                    "status": "unknown",
+                },
                 {"type": "done"},
             ],
         )
@@ -383,7 +440,14 @@ class TestWeb(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(
             graph_service.payloads,
-            [{"user_input": "Hello", "thread_id": "thread-1", "user_id": user_id}],
+            [
+                {
+                    "user_input": "Hello",
+                    "thread_id": "thread-1",
+                    "user_id": user_id,
+                    "trace_id": graph_service.payloads[0]["trace_id"],
+                }
+            ],
         )
 
     def test_invoke_records_provider_usage_once(self):
@@ -418,6 +482,41 @@ class TestWeb(TestCase):
         self.assertEqual(
             session_after.json()["quota"]["tokens"],
             {"input": 12, "output": 5, "total": 17},
+        )
+
+    def test_invoke_ndjson_emits_usage_event(self):
+        app = create_app(
+            UsageGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        session_response = test_client.get("/api/v1/session")
+        cookie_value = session_response.cookies.get("atlas_demo_session")
+
+        res = test_client.post(
+            "/invoke?stream_format=ndjson",
+            headers={"x-trace-id": "trace-fixed"},
+            cookies={"atlas_demo_session": cookie_value},
+            json={"user_input": "Hello", "thread_id": "thread-1"},
+        )
+
+        events = [json.loads(line) for line in res.text.splitlines()]
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(
+            events,
+            [
+                {"type": "token", "text": "token "},
+                {
+                    "type": "usage",
+                    "input_tokens": 12,
+                    "output_tokens": 5,
+                    "total_tokens": 17,
+                    "status": "known",
+                },
+                {"type": "done"},
+            ],
         )
 
     def test_create_thread_sets_active_thread_cookie(self):
@@ -517,6 +616,69 @@ class TestWeb(TestCase):
             ],
         )
 
+    def test_get_thread_returns_persisted_visible_messages(self):
+        app = create_app(
+            UsageGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        session_response = test_client.get("/api/v1/session")
+        cookie_value = session_response.cookies.get("atlas_demo_session")
+        thread_response = test_client.post(
+            "/api/v1/threads",
+            cookies={"atlas_demo_session": cookie_value},
+        )
+
+        test_client.post(
+            f"/api/v1/threads/{thread_response.json()['thread_id']}/messages",
+            cookies={"atlas_demo_session": thread_response.cookies.get("atlas_demo_session")},
+            json={"user_input": "Hello"},
+        )
+
+        restored = test_client.get(
+            f"/api/v1/threads/{thread_response.json()['thread_id']}",
+            cookies={"atlas_demo_session": thread_response.cookies.get("atlas_demo_session")},
+        )
+
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(
+            [message["role"] for message in restored.json()["messages"]],
+            ["user", "assistant"],
+        )
+        self.assertEqual(restored.json()["messages"][0]["content"], "Hello")
+        self.assertEqual(restored.json()["messages"][1]["content"], "token ")
+
+    def test_get_thread_does_not_persist_inline_rag_image_data(self):
+        app = create_app(
+            RagImagesGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        session_response = test_client.get("/api/v1/session")
+        cookie_value = session_response.cookies.get("atlas_demo_session")
+        thread_response = test_client.post(
+            "/api/v1/threads",
+            cookies={"atlas_demo_session": cookie_value},
+        )
+
+        test_client.post(
+            f"/api/v1/threads/{thread_response.json()['thread_id']}/messages",
+            cookies={"atlas_demo_session": thread_response.cookies.get("atlas_demo_session")},
+            json={"user_input": "Show image"},
+        )
+
+        restored = test_client.get(
+            f"/api/v1/threads/{thread_response.json()['thread_id']}",
+            cookies={"atlas_demo_session": thread_response.cookies.get("atlas_demo_session")},
+        )
+
+        self.assertEqual(restored.status_code, 200)
+        assistant_message = restored.json()["messages"][1]
+        self.assertEqual(assistant_message["content"], "Answer text")
+        self.assertNotIn("data:image/", assistant_message["content"])
+
     def test_thread_messages_emit_error_event(self):
         app = create_app(
             ErrorGraphService(),
@@ -574,13 +736,25 @@ class TestWeb(TestCase):
             yield {"type": "done", "text": "Ingestion complete"}
 
         with patch(
-            "atlasai.web.routers.documents.get_stream_ingest_pdf",
-            return_value=fake_stream_ingest_pdf,
+            "atlasai.rag.rag_ingestion.stream_ingest_pdf",
+            new=fake_stream_ingest_pdf,
         ):
             accepted = test_client.post(
                 "/api/v1/documents",
                 cookies={"atlas_demo_session": cookie_value},
                 files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
+            )
+            asyncio.run(
+                process_next_ingestion_job(
+                    app.state.repositories,
+                    app.state.vector_service,
+                    settings=WorkerSettings(
+                        poll_seconds=0.01,
+                        cleanup_poll_seconds=0.01,
+                        heartbeat_timeout_seconds=60,
+                        max_attempts=3,
+                    ),
+                )
             )
             events_response = test_client.get(
                 f"/api/v1/ingestions/{accepted.json()['job_id']}/events",
@@ -615,10 +789,7 @@ class TestWeb(TestCase):
             yield {"type": "done", "text": "Ingestion complete"}
 
         first_session = first_client.get("/api/v1/session")
-        with patch(
-            "atlasai.web.routers.documents.get_stream_ingest_pdf",
-            return_value=fake_stream_ingest_pdf,
-        ):
+        with patch("atlasai.rag.rag_ingestion.stream_ingest_pdf", new=fake_stream_ingest_pdf):
             accepted = first_client.post(
                 "/api/v1/documents",
                 cookies={
@@ -637,6 +808,150 @@ class TestWeb(TestCase):
 
         self.assertEqual(res.status_code, 404)
         self.assertEqual(res.json(), {"detail": "Ingestion job not found."})
+
+    def test_rotate_session_returns_new_identity_and_enqueues_cleanup(self):
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+
+        first = test_client.get("/api/v1/session")
+        original_user_id = first.json()["user_id"]
+        original_cookie = first.cookies.get("atlas_demo_session")
+
+        rotated = test_client.post(
+            "/api/v1/session/rotate",
+            cookies={"atlas_demo_session": original_cookie},
+        )
+
+        self.assertEqual(rotated.status_code, 200)
+        self.assertNotEqual(rotated.json()["user_id"], original_user_id)
+        self.assertEqual(rotated.json()["active_document"], None)
+        self.assertEqual(rotated.json()["active_thread"], None)
+        self.assertEqual(
+            rotated.json()["quota"],
+            {
+                "questions": {"limit": 10, "used": 0, "remaining": 10},
+                "uploads": {"limit": 2, "used": 0, "remaining": 2},
+                "tokens": {"input": 0, "output": 0, "total": 0},
+            },
+        )
+
+        old_cookie_client = TestClient(app)
+        old_cookie_res = old_cookie_client.get(
+            "/api/v1/session",
+            cookies={"atlas_demo_session": original_cookie},
+        )
+        self.assertNotEqual(old_cookie_res.json()["user_id"], original_user_id)
+
+    def test_rotate_session_rejects_invalid_cookie(self):
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+
+        rotated = test_client.post(
+            "/api/v1/session/rotate",
+            cookies={"atlas_demo_session": "invalid-cookie"},
+        )
+
+        self.assertEqual(rotated.status_code, 400)
+        self.assertEqual(rotated.json(), {"detail": "Session not found."})
+
+    def test_rotate_session_resets_browser_and_network_quota_buckets(self):
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+
+        first = test_client.get(
+            "/api/v1/session",
+            headers={"x-atlas-client-key": "safari-browser"},
+        )
+        original_cookie = first.cookies.get("atlas_demo_session")
+
+        invoke = test_client.post(
+            "/invoke",
+            headers={"x-atlas-client-key": "safari-browser"},
+            cookies={"atlas_demo_session": original_cookie},
+            json={"user_input": "Hello", "thread_id": "thread-1"},
+        )
+        self.assertEqual(invoke.status_code, 200)
+        ip_hash = next(iter(app.state.repositories.quotas._ip_snapshots))
+
+        app.state.repositories.quotas.set_client_snapshot(
+            client_key="safari-browser",
+            snapshot=BucketQuotaSnapshot(questions_used=4, uploads_used=2),
+        )
+        app.state.repositories.quotas.set_ip_snapshot(
+            ip_hash=ip_hash,
+            snapshot=BucketQuotaSnapshot(questions_used=8, uploads_used=3),
+        )
+
+        rotated = test_client.post(
+            "/api/v1/session/rotate",
+            headers={"x-atlas-client-key": "safari-browser"},
+            cookies={"atlas_demo_session": original_cookie},
+        )
+
+        self.assertEqual(rotated.status_code, 200)
+        self.assertEqual(
+            app.state.repositories.quotas.get_client_snapshot(
+                client_key="safari-browser"
+            ),
+            BucketQuotaSnapshot(),
+        )
+        self.assertEqual(
+            app.state.repositories.quotas.get_ip_snapshot(ip_hash=ip_hash),
+            BucketQuotaSnapshot(),
+        )
+
+    def test_rotate_session_cleanup_job_deletes_old_runtime_state(self):
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+
+        first = test_client.get("/api/v1/session")
+        original_user_id = first.json()["user_id"]
+        original_cookie = first.cookies.get("atlas_demo_session")
+        image_dir = IMAGE_OUTPUT_DIR / original_user_id
+        image_dir.mkdir(parents=True, exist_ok=True)
+        image_file = image_dir / "sample.png"
+        image_file.write_bytes(b"fake-image")
+
+        test_client.post(
+            "/api/v1/session/rotate",
+            cookies={"atlas_demo_session": original_cookie},
+        )
+
+        asyncio.run(
+            process_next_cleanup_job(
+                app.state.repositories,
+                app.state.vector_service,
+                settings=WorkerSettings(
+                    poll_seconds=0.01,
+                    cleanup_poll_seconds=0.01,
+                    heartbeat_timeout_seconds=60,
+                    max_attempts=3,
+                ),
+            )
+        )
+
+        self.assertNotIn(original_user_id, app.state.repositories.sessions._sessions)
+        self.assertEqual(
+            getattr(app.state.vector_service, "deleted", []),
+            [("raggidy_docs", original_user_id)],
+        )
+        self.assertFalse(image_file.exists())
 
     def test_ingest_pdf_records_unknown_usage_without_affecting_token_totals(self):
         app = create_app(

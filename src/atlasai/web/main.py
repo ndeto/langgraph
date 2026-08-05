@@ -17,7 +17,10 @@ from atlasai.infrastructure.postgres_repositories import (
     InMemoryRepositoryBundle,
     PostgresRepositoryBundle,
 )
-from atlasai.infrastructure.telemetry import usage_record_from_callback
+from atlasai.infrastructure.telemetry import (
+    log_usage_resolution,
+    usage_record_from_callback,
+)
 from atlasai.service.contracts import GraphRunner, InvokePayload
 from atlasai.store.hybrid_store import PostgresVectorService
 from atlasai.web.dependencies import (
@@ -29,8 +32,10 @@ from atlasai.web.dependencies import (
     get_vector_service,
     load_demo_web_settings,
 )
+from atlasai.web.request_identity import build_request_key_hash
 from atlasai.web.routers import documents_router, session_router, threads_router
 from atlasai.web.streaming import extract_usage_payload, format_graph_chunk
+from atlasai.web.streaming import build_usage_event, encode_ndjson_event
 
 LifecycleHook = Callable[[], Awaitable[None]]
 
@@ -38,7 +43,7 @@ sys_config: SysConfig = bootstrap_config()
 WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = WEB_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
-MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 PDF_CONTENT_TYPES = {"application/pdf"}
 StreamFormat = Literal["text", "ndjson"]
 
@@ -109,6 +114,14 @@ def create_app(
     app.include_router(session_router)
     app.include_router(threads_router)
 
+    @app.middleware("http")
+    async def attach_request_identity(request, call_next):
+        request.state.request_key_hash = build_request_key_hash(
+            request,
+            app.state.demo_web_settings,
+        )
+        return await call_next(request)
+
     @app.get("/")
     def _():
         return FileResponse(INDEX_FILE)
@@ -132,7 +145,7 @@ def create_app(
         if not admission.allowed:
             return JSONResponse(
                 status_code=429,
-                content={"detail": admission.reason},
+                content={"detail": admission.message, "code": admission.code},
                 headers={"X-Trace-Id": request_context.trace_id},
             )
 
@@ -144,6 +157,7 @@ def create_app(
         payload: InvokePayload = {
             **input,
             "user_id": request_context.session.session.user_id,
+            "trace_id": request_context.trace_id,
         }
 
         async def response_stream():
@@ -151,17 +165,25 @@ def create_app(
             try:
                 async for chunk in graph_service.stream(payload):
                     if isinstance(chunk, dict) and chunk.get("type") == "final":
+                        usage_payload = extract_usage_payload(chunk.get("data"))
+                        record = usage_record_from_callback(
+                            operation="agent",
+                            payload=usage_payload,
+                            provider=sys_config["model"]["provider"],
+                            model=sys_config["model"]["model"],
+                            trace_id=request_context.trace_id,
+                        )
+                        log_usage_resolution(
+                            source="invoke.final",
+                            payload=usage_payload,
+                            record=record,
+                        )
                         usage_service.record_usage(
                             user_id=request_context.session.session.user_id,
-                            record=usage_record_from_callback(
-                                operation="agent",
-                                payload=extract_usage_payload(chunk.get("data")),
-                                provider=sys_config["model"]["provider"],
-                                model=sys_config["model"]["model"],
-                                trace_id=request_context.trace_id,
-                                run_id=request_context.trace_id,
-                            ),
+                            record=record,
                         )
+                        if stream_format == "ndjson":
+                            yield encode_ndjson_event(build_usage_event(record))
                         usage_recorded = True
 
                     formatted_chunk = format_graph_chunk(chunk, stream_format)
@@ -169,16 +191,22 @@ def create_app(
                         yield formatted_chunk
             finally:
                 if not usage_recorded:
+                    record = usage_record_from_callback(
+                        operation="agent",
+                        payload=None,
+                        provider=sys_config["model"]["provider"],
+                        model=sys_config["model"]["model"],
+                        trace_id=request_context.trace_id,
+                        run_id=request_context.trace_id,
+                    )
+                    log_usage_resolution(
+                        source="invoke.missing-final",
+                        payload=None,
+                        record=record,
+                    )
                     usage_service.record_usage(
                         user_id=request_context.session.session.user_id,
-                        record=usage_record_from_callback(
-                            operation="agent",
-                            payload=None,
-                            provider=sys_config["model"]["provider"],
-                            model=sys_config["model"]["model"],
-                            trace_id=request_context.trace_id,
-                            run_id=request_context.trace_id,
-                        ),
+                        record=record,
                     )
                 quota_service.release_agent_run(
                     user_id=request_context.session.session.user_id
@@ -223,7 +251,7 @@ def create_app(
             return JSONResponse(
                 status_code=400,
                 content={
-                    "detail": "PDF exceeds the 25 MB upload limit.",
+                    "detail": "PDF exceeds the 10 MB upload limit.",
                     "max_size_bytes": MAX_UPLOAD_SIZE_BYTES,
                 },
             )
@@ -234,7 +262,7 @@ def create_app(
         if not admission.allowed:
             return JSONResponse(
                 status_code=429,
-                content={"detail": admission.reason},
+                content={"detail": admission.message, "code": admission.code},
                 headers={"X-Trace-Id": request_context.trace_id},
             )
 

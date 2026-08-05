@@ -11,12 +11,12 @@ import type { DocumentSummary } from "./lib/types";
 function App() {
   const session = useSession();
   const [localDocument, setLocalDocument] = useState<DocumentSummary | null>(null);
-  const [isPanelPinned, setIsPanelPinned] = useState(false);
+  const [isPanelOpen, setIsPanelOpen] = useState(false);
   const sessionData = session.state.status === "ready" ? session.state.data : null;
   const documentForChat = localDocument ?? sessionData?.activeDocument ?? null;
   const conversation = useConversation({
     activeThread: sessionData?.activeThread ?? null,
-    documentId: documentForChat?.id ?? null,
+    documentId: null,
     onUsage(usage) {
       session.applyUsage({
         input: usage.input,
@@ -35,7 +35,6 @@ function App() {
     activeDocument: documentForChat,
     onUploadComplete(document) {
       setLocalDocument(document);
-      conversation.resetConversation();
       void session.refresh();
     },
   });
@@ -44,21 +43,33 @@ function App() {
     () => upload.state.document ?? localDocument ?? sessionData?.activeDocument ?? null,
     [localDocument, sessionData?.activeDocument, upload.state.document],
   );
-  const isIngesting = ["validating", "uploading", "processing"].includes(upload.state.status);
-  const showPanel = isPanelPinned || isIngesting;
+  const showPanel = isPanelOpen;
 
   function handlePickFile(file: File) {
-    const shouldReplace =
-      activeDocument &&
-      globalThis.confirm(
-        `Replace ${activeDocument.name}? A successful upload should start a fresh document-bound thread.`,
-      ) === false;
+    setIsPanelOpen(true);
+    void upload.beginUpload(file);
+  }
 
-    if (shouldReplace) {
+  async function handleRotateSession() {
+    if (
+      globalThis.confirm(
+        "Start a fresh session? Current uploads, chat, and usage will be queued for deletion.",
+      ) === false
+    ) {
       return;
     }
 
-    void upload.beginUpload(file);
+    try {
+      const nextSession = await session.rotate();
+      setLocalDocument(nextSession.activeDocument);
+      upload.resetUpload(nextSession.activeDocument);
+      conversation.resetConversation();
+      setIsPanelOpen(false);
+    } catch (error) {
+      globalThis.alert(
+        error instanceof Error ? error.message : "Unable to start a new session.",
+      );
+    }
   }
 
   if (session.state.status === "loading") {
@@ -85,7 +96,16 @@ function App() {
 
   return (
     <main className="app-shell">
-      <div className={`page-frame${showPanel ? " page-frame-with-panel" : ""}`}>
+      {showPanel ? (
+        <button
+          className={`panel-backdrop${isPanelOpen ? " panel-backdrop-visible" : ""}`}
+          type="button"
+          aria-label="Close panel"
+          onClick={() => setIsPanelOpen(false)}
+        />
+      ) : null}
+
+      <div className="page-frame">
         <section className="main-stage main-stage-editorial">
           <HeroHeader hasMessages={conversation.messages.length > 0} />
           <ConversationView
@@ -94,22 +114,24 @@ function App() {
             disabled={conversation.isStreaming}
             onSend={conversation.sendMessage}
             onPickFile={handlePickFile}
-            onTogglePanel={() => setIsPanelPinned((current) => !current)}
+            onTogglePanel={() => setIsPanelOpen((current) => !current)}
             panelOpen={showPanel}
           />
         </section>
-
-        <aside className={`dock-stage${showPanel ? " dock-stage-open" : ""}`}>
-          <DocumentStageCard
-            session={session.state.data}
-            activeDocument={activeDocument}
-            upload={upload.state}
-            open={showPanel}
-            pinned={isPanelPinned}
-            onClose={() => setIsPanelPinned(false)}
-          />
-        </aside>
       </div>
+
+      <aside className={`dock-stage${showPanel ? " dock-stage-open" : ""}`}>
+        <DocumentStageCard
+          session={session.state.data}
+          activeDocument={activeDocument}
+          upload={upload.state}
+          open={showPanel}
+          pinned={isPanelOpen}
+          rotatingSession={session.isRotating}
+          onClose={() => setIsPanelOpen(false)}
+          onRotateSession={() => void handleRotateSession()}
+        />
+      </aside>
     </main>
   );
 }

@@ -4,6 +4,7 @@ import { atlasApi } from "../lib/api";
 import type {
   ChatEvent,
   ConversationMessage,
+  PersistedThreadMessage,
   ThreadSummary,
 } from "../lib/types";
 
@@ -29,6 +30,36 @@ function createAssistantMessage(): ConversationMessage {
   };
 }
 
+function appendAssetsToLatestAssistant(
+  current: ConversationMessage[],
+  assets: ConversationMessage["assets"],
+): ConversationMessage[] {
+  for (let index = current.length - 1; index >= 0; index -= 1) {
+    const message = current[index];
+    if (message.role !== "assistant") {
+      continue;
+    }
+
+    return current.map((entry, entryIndex) =>
+      entryIndex === index
+        ? { ...entry, assets: [...entry.assets, ...assets] }
+        : entry,
+    );
+  }
+
+  return [...current, { ...createAssistantMessage(), assets }];
+}
+
+function mapPersistedMessage(message: PersistedThreadMessage): ConversationMessage {
+  return {
+    id: message.messageId,
+    role: message.role,
+    content: message.content,
+    status: message.status,
+    assets: message.assets,
+  };
+}
+
 export function useConversation(options: Options) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [thread, setThread] = useState<ThreadSummary | null>(options.activeThread);
@@ -39,6 +70,37 @@ export function useConversation(options: Options) {
     if (options.activeThread) {
       setThread(options.activeThread);
     }
+  }, [options.activeThread]);
+
+  useEffect(() => {
+    if (!options.activeThread || options.activeThread.mode !== "server") {
+      return;
+    }
+
+    let cancelled = false;
+    void atlasApi
+      .getThread(options.activeThread.id)
+      .then((detail) => {
+        if (cancelled) {
+          return;
+        }
+        setThread({
+          id: detail.id,
+          mode: detail.mode,
+          documentId: detail.documentId,
+        });
+        setMessages(detail.messages.map(mapPersistedMessage));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setThread(null);
+          setMessages([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [options.activeThread]);
 
   const ensureThread = useCallback(async () => {
@@ -93,24 +155,27 @@ export function useConversation(options: Options) {
     }
 
     if (event.type === "legacy_markdown") {
-      setMessages((current) =>
-        current.map((message, index) =>
-          index === current.length - 1
-            ? { ...message, content: message.content + event.markdown }
-            : message,
-        ),
-      );
+      setMessages((current) => {
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          const message = current[index];
+          if (message.role !== "assistant") {
+            continue;
+          }
+
+          return current.map((entry, entryIndex) =>
+            entryIndex === index
+              ? { ...entry, content: entry.content + event.markdown }
+              : entry,
+          );
+        }
+
+        return [...current, { ...createAssistantMessage(), content: event.markdown }];
+      });
       return;
     }
 
     if (event.type === "sources") {
-      setMessages((current) =>
-        current.map((message, index) =>
-          index === current.length - 1
-            ? { ...message, assets: [...message.assets, ...event.assets] }
-            : message,
-        ),
-      );
+      setMessages((current) => appendAssetsToLatestAssistant(current, event.assets));
       return;
     }
 

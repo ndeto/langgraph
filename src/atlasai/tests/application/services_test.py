@@ -3,11 +3,10 @@ from types import SimpleNamespace
 
 from atlasai.application.quotas import (
     AdmissionResult,
+    BucketQuotaSnapshot,
     InMemoryQuotaRepository,
     QuotaPolicy,
-    RequestKeyQuotaSnapshot,
     QuotaService,
-    QuotaSnapshot,
 )
 from atlasai.application.usage import (
     InMemoryUsageRepository,
@@ -120,17 +119,30 @@ class TestRagIngestion(unittest.TestCase):
 
         self.assertEqual(document.metadata["user_id"], "user-123")
 
+    def test_summarize_chunk_stores_document_id_in_metadata(self):
+        chunk = SimpleNamespace(
+            text="Atlas AI document text",
+            metadata=SimpleNamespace(orig_elements=[]),
+        )
+
+        document = summarize_chunk(
+            chunk,
+            current_chunk=1,
+            total_chunks=1,
+            document_id="document-123",
+        )
+
+        self.assertEqual(document.metadata["document_id"], "document-123")
+
 
 class TestQuotaService(unittest.TestCase):
     def test_quota_summary_uses_snapshot_and_policy(self):
         repository = InMemoryQuotaRepository()
-        repository.set_snapshot(
-            user_id="user-1",
-            snapshot=QuotaSnapshot(
+        repository.set_client_snapshot(
+            client_key="browser-1",
+            snapshot=BucketQuotaSnapshot(
                 questions_used=3,
                 uploads_used=1,
-                active_ingestions=0,
-                active_agent_runs=0,
             ),
         )
         service = QuotaService(
@@ -143,6 +155,8 @@ class TestQuotaService(unittest.TestCase):
                 concurrent_agent_runs_per_user=1,
             ),
             repository=repository,
+            client_key="browser-1",
+            ip_hash="network-1",
         )
 
         summary = service.get_session_quota_summary(
@@ -170,15 +184,21 @@ class TestQuotaService(unittest.TestCase):
                 concurrent_agent_runs_per_user=1,
             ),
             repository=repository,
+            client_key="browser-1",
+            ip_hash="network-1",
         )
 
         first = service.claim_question(user_id="user-1")
         second = service.claim_question(user_id="user-1")
 
-        self.assertEqual(first, AdmissionResult(allowed=True))
+        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
         self.assertEqual(
             second,
-            AdmissionResult(allowed=False, reason="Question quota exceeded."),
+            AdmissionResult(
+                allowed=False,
+                code="browser_question_quota_reached",
+                message="Question quota reached for this browser session.",
+            ),
         )
 
         service.release_agent_run(user_id="user-1")
@@ -197,17 +217,20 @@ class TestQuotaService(unittest.TestCase):
                 concurrent_agent_runs_per_user=1,
             ),
             repository=repository,
+            client_key="browser-1",
+            ip_hash="network-1",
         )
 
         first = service.claim_upload(user_id="user-1")
         second = service.claim_upload(user_id="user-1")
 
-        self.assertEqual(first, AdmissionResult(allowed=True))
+        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
         self.assertEqual(
             second,
             AdmissionResult(
                 allowed=False,
-                reason="Another document ingestion is already in progress.",
+                code="ingestion_in_progress",
+                message="Another document is still processing.",
             ),
         )
 
@@ -225,20 +248,29 @@ class TestQuotaService(unittest.TestCase):
             repository=repository,
         )
 
-        first = service.claim_question(user_id="user-1", request_key="hash-1")
-        second = service.claim_question(user_id="user-2", request_key="hash-1")
+        first = service.claim_question(
+            user_id="user-1",
+            client_key="browser-1",
+            ip_hash="hash-1",
+        )
+        second = service.claim_question(
+            user_id="user-2",
+            client_key="browser-2",
+            ip_hash="hash-1",
+        )
 
-        self.assertEqual(first, AdmissionResult(allowed=True))
+        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
         self.assertEqual(
             second,
             AdmissionResult(
                 allowed=False,
-                reason="Question quota exceeded for this request key.",
+                code="network_question_quota_reached",
+                message="Question quota reached for this network.",
             ),
         )
         self.assertEqual(
-            repository.get_request_key_snapshot(request_key="hash-1"),
-            RequestKeyQuotaSnapshot(questions_used=1, uploads_used=0),
+            repository.get_ip_snapshot(ip_hash="hash-1"),
+            BucketQuotaSnapshot(questions_used=1, uploads_used=0),
         )
 
     def test_claim_upload_enforces_request_key_limit_across_users(self):
@@ -255,20 +287,29 @@ class TestQuotaService(unittest.TestCase):
             repository=repository,
         )
 
-        first = service.claim_upload(user_id="user-1", request_key="hash-1")
-        second = service.claim_upload(user_id="user-2", request_key="hash-1")
+        first = service.claim_upload(
+            user_id="user-1",
+            client_key="browser-1",
+            ip_hash="hash-1",
+        )
+        second = service.claim_upload(
+            user_id="user-2",
+            client_key="browser-2",
+            ip_hash="hash-1",
+        )
 
-        self.assertEqual(first, AdmissionResult(allowed=True))
+        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
         self.assertEqual(
             second,
             AdmissionResult(
                 allowed=False,
-                reason="Upload quota exceeded for this request key.",
+                code="network_upload_quota_reached",
+                message="Upload quota reached for this network.",
             ),
         )
         self.assertEqual(
-            repository.get_request_key_snapshot(request_key="hash-1"),
-            RequestKeyQuotaSnapshot(questions_used=0, uploads_used=1),
+            repository.get_ip_snapshot(ip_hash="hash-1"),
+            BucketQuotaSnapshot(questions_used=0, uploads_used=1),
         )
 
 

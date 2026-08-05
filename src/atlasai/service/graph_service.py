@@ -1,14 +1,17 @@
 import asyncio
 import json
+import logging
 import os
 import tracemalloc
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
+from typing import cast
 
 import requests
 from langchain.messages import HumanMessage, RemoveMessage, SystemMessage, trim_messages
-from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
 from langchain.tools import BaseTool, tool
 from langchain_classic.prompts import PromptTemplate
+from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
@@ -28,10 +31,16 @@ from typing_extensions import TypedDict
 
 from atlasai.config.models import search_model, system_model
 from atlasai.config.sys_config import SysConfig
+from atlasai.infrastructure.telemetry import (
+    TelemetryContext,
+    build_langfuse_callback,
+    build_telemetry_metadata,
+    langfuse_attributes,
+)
 from atlasai.lib.session import Context, MemoryUpdateResult, StateContext
 from atlasai.rag.utils import (
     build_document_context_prompt,
-    build_retrieved_image_markdown,
+    build_retrieved_image_assets,
 )
 from atlasai.service.contracts import GraphRunner, InvokePayload
 from atlasai.store import PostgresVectorService, tool_store
@@ -40,6 +49,8 @@ from atlasai.util.utils import load_file
 
 if not tracemalloc.is_tracing():
     tracemalloc.start(25)
+
+logger = logging.getLogger(__name__)
 
 
 class GraphService(GraphRunner):
@@ -163,7 +174,7 @@ class GraphService(GraphRunner):
         if not query:
             return {"resolved_tools": []}
 
-        status = "[Atlas AI] Selecting tools..."
+        status = "[Atlas AI] Running..."
         print(status, flush=True)
         runtime.stream_writer({"type": "status", "data": status})
 
@@ -193,17 +204,23 @@ class GraphService(GraphRunner):
         system_instruction = f"Available Tools: {state.get('resolved_tools')}"
         user_input = state.get("user_input") or ""
         user_id = state.get("user_id")
+        thread_id = state.get("thread_id")
+        document_id = state.get("document_id")
+        trace_id = state.get("trace_id")
 
+        filter_payload: dict[str, str] | None = None
+        if user_id:
+            filter_payload = {"user_id": user_id}
         rag_res = await self.vector_service.asimilarity_search(
             table_name="raggidy_docs",
             query=user_input,
-            filter={"user_id": user_id} if user_id else None,
+            filter=filter_payload,
         )
 
         rag_context = build_document_context_prompt(
             user_input, rag_res, "knowledge-base"
         )
-        rag_image_markdown = build_retrieved_image_markdown(rag_res)
+        related_image_assets = build_retrieved_image_assets(rag_res)
 
         history = state.get("messages") or []
         system_context = "\n\n".join(
@@ -242,10 +259,40 @@ class GraphService(GraphRunner):
         print(llm_status, flush=True)
         runtime.stream_writer({"type": "status", "data": llm_status})
         usage_callback = UsageMetadataCallbackHandler()
-        response = await llm.bind_tools(tools).ainvoke(
-            trimmed_messages,
-            config={"callbacks": [usage_callback]},
+        telemetry_context = TelemetryContext(
+            operation="agent",
+            user_id=user_id,
+            thread_id=thread_id,
+            document_id=document_id,
+            trace_id=trace_id,
+            provider=self.sys_config["model"]["provider"],
+            model=self.sys_config["model"]["model"],
         )
+        callbacks = [usage_callback]
+        langfuse_callback = build_langfuse_callback()
+        if langfuse_callback is not None:
+            callbacks.append(langfuse_callback)
+        metadata = build_telemetry_metadata(telemetry_context)
+        langfuse_ctx = (
+            langfuse_attributes(
+                telemetry_context,
+                trace_name="atlas-main-agent",
+            )
+            if langfuse_callback is not None
+            else nullcontext()
+        )
+        with langfuse_ctx:
+            response = await llm.bind_tools(tools).ainvoke(
+                trimmed_messages,
+                config=cast(
+                    RunnableConfig,
+                    {
+                        "callbacks": callbacks,
+                        "run_name": "atlas-main-agent",
+                        "metadata": metadata,
+                    },
+                ),
+            )
 
         for tool_call in response.tool_calls:
             tool_status = f"[Atlas AI] Calling tool: {tool_call['name']}"
@@ -263,15 +310,30 @@ class GraphService(GraphRunner):
                 "usage_metadata": response_usage_metadata,
             }
         elif usage_callback.usage_metadata:
-            model_name, usage_metadata = next(iter(usage_callback.usage_metadata.items()))
+            model_name, usage_metadata = next(
+                iter(usage_callback.usage_metadata.items())
+            )
             usage_payload = {
                 "model_name": model_name,
                 "usage_metadata": usage_metadata,
             }
 
+        logger.info(
+            "agent_usage_payload trace_id=%s has_payload=%s response_usage_keys=%s "
+            "callback_models=%s",
+            trace_id,
+            usage_payload is not None,
+            sorted(response_usage_metadata.keys())
+            if isinstance(response_usage_metadata, dict)
+            else [],
+            sorted(usage_callback.usage_metadata.keys()),
+        )
+        if usage_payload is not None:
+            runtime.stream_writer({"type": "usage_payload", "data": usage_payload})
+
         return {
             "messages": [response],
-            "rag_image_markdown": rag_image_markdown or None,
+            "selected_image_assets": related_image_assets or None,
             "usage_payload": usage_payload,
         }
 
@@ -344,13 +406,41 @@ class GraphService(GraphRunner):
 
         existing_memory = load_file(memory_path)
 
-        res = extractor.invoke(
-            {
-                "messages": messages[-5:],
-                "user_input": state.get("user_input"),
-                "existing_memory": existing_memory,
-            }
+        telemetry_context = TelemetryContext(
+            operation="memory",
+            user_id=state.get("user_id"),
+            thread_id=state.get("thread_id"),
+            document_id=state.get("document_id"),
+            trace_id=state.get("trace_id"),
+            provider=self.sys_config["model"]["provider"],
+            model="gpt-4o-mini",
         )
+        callbacks = []
+        langfuse_callback = build_langfuse_callback()
+        if langfuse_callback is not None:
+            callbacks.append(langfuse_callback)
+        metadata = build_telemetry_metadata(telemetry_context)
+        langfuse_ctx = (
+            langfuse_attributes(
+                telemetry_context,
+                trace_name="atlas-memory-extractor",
+            )
+            if langfuse_callback is not None
+            else nullcontext()
+        )
+        with langfuse_ctx:
+            res = extractor.invoke(
+                {
+                    "messages": messages[-5:],
+                    "user_input": state.get("user_input"),
+                    "existing_memory": existing_memory,
+                },
+                config={
+                    "callbacks": callbacks,
+                    "run_name": "atlas-memory-extractor",
+                    "metadata": metadata,
+                },
+            )
 
         updated_long_term_memory = (
             res.get("updated_long_term_memory") or existing_memory
@@ -400,6 +490,8 @@ class GraphService(GraphRunner):
         return config
 
     async def run_memory_graph(self, thread_id, state):
+        if self.memory_graph is None:
+            raise RuntimeError("Graph service startup must run before memory graph use.")
         return await self.memory_graph.ainvoke(
             state,
             config=self.build_graph_config(thread_id, "atlasai-memory-graph"),
@@ -435,16 +527,27 @@ class GraphService(GraphRunner):
         self,
         payload: InvokePayload,
     ) -> AsyncIterator[object]:
-        query = payload.get("user_input")
+        if self.graph is None:
+            raise RuntimeError("Graph service startup must run before streaming.")
+
+        query = payload["user_input"]
+        thread_id = payload["thread_id"]
+        trace_id = payload.get("trace_id") or thread_id
         try:
             current_state: StateContext = {
                 "user_input": query,
-                "user_id": payload.get("user_id"),
+                "thread_id": thread_id,
+                "trace_id": trace_id,
                 "messages": [HumanMessage(content=query)],
             }
-            thread_id = payload.get("thread_id")
+            user_id = payload.get("user_id")
+            if user_id is not None:
+                current_state["user_id"] = user_id
+            if "document_id" in payload:
+                current_state["document_id"] = payload["document_id"]
 
             last_state: StateContext | None = None
+            latest_usage_payload: object | None = None
 
             async for chunk in self.graph.astream(
                 current_state,
@@ -459,6 +562,11 @@ class GraphService(GraphRunner):
                     status = chunk["data"]
                     if isinstance(status, dict) and status.get("type") == "status":
                         yield status
+                    elif (
+                        isinstance(status, dict)
+                        and status.get("type") == "usage_payload"
+                    ):
+                        latest_usage_payload = status.get("data")
                 elif chunk["type"] == "messages":
                     # Stream Node Status
                     message, metadata = chunk["data"]
@@ -470,11 +578,17 @@ class GraphService(GraphRunner):
                         yield {"type": "token", "data": token}
 
             if last_state is not None:
-                rag_image_markdown = last_state.get("rag_image_markdown")
-                if isinstance(rag_image_markdown, str) and rag_image_markdown.strip():
-                    yield {"type": "rag_images", "data": rag_image_markdown}
+                selected_image_assets = last_state.get("selected_image_assets")
+                if isinstance(selected_image_assets, list) and selected_image_assets:
+                    yield {"type": "sources", "data": selected_image_assets}
 
-                yield {"type": "final", "data": last_state}
+                final_state: StateContext | dict[str, object] = last_state
+                if latest_usage_payload is not None and not last_state.get(
+                    "usage_payload"
+                ):
+                    final_state = {**last_state, "usage_payload": latest_usage_payload}
+
+                yield {"type": "final", "data": final_state}
 
                 memory_task = asyncio.create_task(
                     self.run_memory_graph(thread_id, last_state)

@@ -31,9 +31,12 @@ class StateContext(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     user_input: str
     user_id: str
+    thread_id: str
+    document_id: str | None
+    trace_id: str
     available_tools_metadata: list | None
     resolved_tools: list[str]
     recent_facts: list[Facts]
     user_mood: str | None
-    rag_image_markdown: str | None
+    selected_image_assets: list[dict] | None
     usage_payload: dict | None

@@ -1,5 +1,6 @@
 from collections.abc import Iterable, Sequence
 from logging import Logger
+from sys import prefix
 
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
@@ -8,6 +9,7 @@ from langchain_postgres.v2.hybrid_search_config import (
     HybridSearchConfig,
     reciprocal_rank_fusion,
 )
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from atlasai.config.sys_config import get_env
@@ -84,6 +86,21 @@ class PostgresVectorService:
         """Run similarity search against a warmed table."""
 
         return await self.get_store(table_name).asimilarity_search(query, **kwargs)
+
+    async def adelete_by_user(self, *, table_name: str, user_id: str) -> None:
+        """Delete all rows owned by the given user from the configured table."""
+
+        if self.engine is None:
+            raise RuntimeError("Vector service startup must run before use.")
+
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"DELETE FROM {table_name} "
+                    "WHERE langchain_metadata->>'user_id' = :user_id"
+                ),
+                {"user_id": user_id},
+            )
 
     async def _init_store(self, table_name: str) -> None:
         if self.pg_engine is None:

@@ -1,8 +1,15 @@
+import os
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from uuid import uuid4
 
+from langfuse import propagate_attributes
+from langfuse.langchain import CallbackHandler
+
 from atlasai.application.usage import UsageRecord
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,6 +48,30 @@ def ensure_trace_id(trace_id: str | None) -> str:
     return trace_id or str(uuid4())
 
 
+def build_langfuse_callback() -> CallbackHandler | None:
+    """Return a Langfuse callback handler when configured."""
+
+    if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
+        return None
+    return CallbackHandler()
+
+
+def langfuse_attributes(
+    context: TelemetryContext,
+    *,
+    trace_name: str,
+):
+    """Attach Langfuse metadata to the current execution context."""
+
+    metadata = build_telemetry_metadata(context)
+    return propagate_attributes(
+        user_id=context.user_id,
+        session_id=context.thread_id,
+        metadata=metadata,
+        trace_name=trace_name,
+    )
+
+
 def usage_record_from_callback(
     *,
     operation: str,
@@ -75,6 +106,39 @@ def usage_record_from_callback(
         total_tokens=total_tokens,
         status=status,
         trace_id=trace_id or _extract_string(payload, "trace_id"),
+    )
+
+
+def log_usage_resolution(
+    *,
+    source: str,
+    payload: object | None,
+    record: UsageRecord,
+) -> None:
+    """Log resolved usage details for debugging token accounting."""
+
+    usage_mapping = _extract_usage_mapping(payload)
+    response_token_usage = _lookup_value(
+        _lookup_value(payload, "response_metadata"),
+        "token_usage",
+    )
+    logger.info(
+        "usage_resolution source=%s status=%s input_tokens=%s output_tokens=%s "
+        "total_tokens=%s run_id=%s model=%s provider=%s payload_type=%s "
+        "usage_keys=%s response_token_usage_keys=%s",
+        source,
+        record.status,
+        record.input_tokens,
+        record.output_tokens,
+        record.total_tokens,
+        record.run_id,
+        record.model,
+        record.provider,
+        type(payload).__name__ if payload is not None else None,
+        sorted(usage_mapping.keys()),
+        sorted(response_token_usage.keys())
+        if isinstance(response_token_usage, Mapping)
+        else [],
     )
 
 

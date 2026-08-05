@@ -51,7 +51,7 @@ def doc_to_prompt_text(chunk: Any) -> str:
     return page_content.strip()
 
 
-def extract_image_paths(chunk: Any) -> list[str]:
+def extract_image_entries(chunk: Any) -> list[dict[str, Any]]:
     metadata = getattr(chunk, "metadata", {}) or {}
     original_content = metadata.get("original_content")
     if not original_content:
@@ -61,27 +61,25 @@ def extract_image_paths(chunk: Any) -> list[str]:
     if not isinstance(original_data, dict):
         return []
 
-    image_paths = read_json_field(original_data.get("image_paths", []))
-    if isinstance(image_paths, str):
-        image_paths = [image_paths] if image_paths.strip() else []
-
-    if not isinstance(image_paths, list):
+    image_entries = read_json_field(original_data.get("image_entries", []))
+    if not isinstance(image_entries, list):
         return []
 
-    return [str(path).strip() for path in image_paths if str(path).strip()]
+    return [entry for entry in image_entries if isinstance(entry, dict)]
 
 
-def build_retrieved_image_markdown(
+def build_retrieved_image_assets(
     chunks: list[Any],
     *,
     max_images: int = 3,
-) -> str:
-    image_markdown: list[str] = []
+) -> list[dict[str, str]]:
+    assets: list[dict[str, str]] = []
     seen_paths: set[str] = set()
 
     for chunk in chunks:
-        for image_path in extract_image_paths(chunk):
-            if image_path in seen_paths:
+        for image_entry in extract_image_entries(chunk):
+            image_path = str(image_entry.get("path", "")).strip()
+            if not image_path or image_path in seen_paths:
                 continue
 
             seen_paths.add(image_path)
@@ -89,18 +87,20 @@ def build_retrieved_image_markdown(
             if not data_url:
                 continue
 
-            image_index = len(image_markdown) + 1
-            image_markdown.append(f"![Retrieved image {image_index}]({data_url})")
-            if len(image_markdown) >= max_images:
-                break
+            mime_type = str(image_entry.get("mime_type", "image/png")).strip()
+            assets.append(
+                {
+                    "asset_id": data_url,
+                    "mime_type": mime_type or "image/png",
+                }
+            )
+            if len(assets) >= max_images:
+                return assets
 
-        if len(image_markdown) >= max_images:
+        if len(assets) >= max_images:
             break
 
-    if not image_markdown:
-        return ""
-
-    return "\n\n### Retrieved Images\n\n" + "\n\n".join(image_markdown)
+    return assets
 
 
 def build_document_context_prompt(

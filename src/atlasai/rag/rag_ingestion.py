@@ -1,8 +1,10 @@
 import asyncio
 import json
+import mimetypes
+import re
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, cast, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -14,7 +16,7 @@ from unstructured.chunking.title import chunk_by_title
 from unstructured.partition.pdf import partition_pdf
 
 from atlasai.config.sys_config import SysConfig, bootstrap_config
-from atlasai.rag.image_payloads import persist_base64_image
+from atlasai.rag.image_payloads import image_file_to_data_url, persist_base64_image
 from atlasai.store.hybrid_store import PostgresVectorService
 
 config: SysConfig = bootstrap_config()
@@ -38,7 +40,7 @@ def build_ingestion_event(
     text: str | None = None,
     **extra: Any,
 ) -> IngestionEvent:
-    event: IngestionEvent = {"type": event_type, **extra}
+    event = cast(IngestionEvent, {"type": event_type, **extra})
     if text is not None:
         event["text"] = text
     return event
@@ -75,14 +77,30 @@ def partition_pdf_doc(
     logger: Callable[[IngestionEvent], None] | None = None,
 ):
     """Partitions the document"""
-    emit_log(logger, "Partitioning document")
-    elements = partition_pdf(
-        filename=str(path),
-        strategy="hi_res",
-        infer_table_structure=True,
-        extract_image_block_types=["Image"],
-        extract_image_block_to_payload=True,
+    resolved_path = Path(path)
+    emit_log(
+        logger,
+        (
+            "Partitioning document "
+            f"(path={resolved_path}, exists={resolved_path.exists()}, "
+            f"size_bytes={resolved_path.stat().st_size if resolved_path.exists() else 'missing'}, "
+            "strategy=hi_res, extract_images=True)"
+        ),
     )
+    try:
+        elements = partition_pdf(
+            filename=str(resolved_path),
+            strategy="hi_res",
+            infer_table_structure=True,
+            extract_image_block_types=["Image"],
+            extract_image_block_to_payload=True,
+        )
+    except Exception as exc:
+        emit_log(
+            logger,
+            f"Partitioning failed in hi_res mode: {type(exc).__name__}: {exc}",
+        )
+        raise
 
     emit_log(logger, f"Found {len(elements)} elements")
     return elements
@@ -112,6 +130,14 @@ class ContentData(TypedDict):
     types: list
 
 
+class ImageEntry(TypedDict, total=False):
+    image_id: str
+    path: str
+    mime_type: str
+    context_text: str
+    summary: str
+
+
 def extract_chunk_text(chunk: Element) -> str:
     """Extract usable text from HTML or PDF chunks."""
     text = getattr(chunk, "text", None)
@@ -125,16 +151,147 @@ def extract_chunk_text(chunk: Element) -> str:
     return str(chunk).strip()
 
 
-def separate_content_types(chunk: Element) -> ContentData:
+def normalize_image_context(context_text: str, *, max_chars: int = 220) -> str:
+    """Compress nearby chunk text into a short retrieval hint."""
+
+    compact = re.sub(r"\s+", " ", context_text).strip()
+    if not compact:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", compact)
+    excerpt = " ".join(sentence.strip() for sentence in sentences[:2] if sentence.strip())
+    if not excerpt:
+        excerpt = compact
+
+    if len(excerpt) > max_chars:
+        return excerpt[:max_chars].rstrip() + "..."
+
+    return excerpt
+
+
+def build_contextual_image_summary(context_text: str) -> str:
+    """Build a chunk-grounded fallback summary for an extracted image."""
+
+    context_excerpt = normalize_image_context(context_text)
+    if not context_excerpt:
+        return "Document image extracted from the uploaded file."
+
+    return f"Document image related to: {context_excerpt}"
+
+
+def is_generic_image_summary(summary: str) -> bool:
+    """Detect low-information image summaries."""
+
+    normalized = summary.strip().lower()
+    return normalized in {
+        "",
+        "document image",
+        "retrieved image",
+        "document image extracted from the uploaded file.",
+    }
+
+
+def summarize_image_for_retrieval(
+    image_path: str,
+    *,
+    context_text: str,
+) -> str:
+    """Create a retrieval-oriented summary for one extracted image."""
+
+    data_url = image_file_to_data_url(image_path)
+    if not data_url:
+        return build_contextual_image_summary(context_text)
+
+    llm = ChatOpenAI()
+    context_excerpt = normalize_image_context(context_text, max_chars=1200)
+    if not context_excerpt:
+        context_excerpt = "No nearby text available."
+    prompt = [
+        {
+            "type": "text",
+            "text": (
+                "Summarize this document image for retrieval.\n"
+                "Focus on what kind of image it is and how it relates to the nearby document text.\n"
+                "Call out if it is mostly a logo, header mark, signature, stamp, photo, chart, table, or form section.\n"
+                "Mention any clearly visible labels or fields when obvious.\n"
+                "If it appears decorative or low-value, say that clearly and tie it to the nearby section.\n"
+                f"Nearby document text:\n{context_excerpt}\n\n"
+                "Return one concise sentence."
+            ),
+        },
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+
+    response = llm.invoke([{"role": "user", "content": prompt}])
+    content = response.content
+    if isinstance(content, str):
+        summary = content.strip()
+        if not is_generic_image_summary(summary):
+            return summary
+        return build_contextual_image_summary(context_text)
+    if isinstance(content, list):
+        text_parts = [
+            part.get("text", "").strip()
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        if text_parts:
+            summary = " ".join(part for part in text_parts if part).strip()
+            if not is_generic_image_summary(summary):
+                return summary
+            return build_contextual_image_summary(context_text)
+    return build_contextual_image_summary(context_text)
+
+
+def build_image_entry(
+    image_path: str,
+    *,
+    context_text: str,
+    image_index: int,
+) -> ImageEntry:
+    """Build stored metadata for one extracted image."""
+
+    mime_type, _ = mimetypes.guess_type(image_path)
+    if not mime_type:
+        mime_type = "image/png"
+
+    try:
+        summary = summarize_image_for_retrieval(
+            image_path,
+            context_text=context_text,
+        )
+    except Exception:
+        summary = build_contextual_image_summary(context_text)
+
+    if is_generic_image_summary(summary):
+        summary = build_contextual_image_summary(context_text)
+
+    return {
+        "image_id": f"img_{image_index}",
+        "path": image_path,
+        "mime_type": mime_type,
+        "context_text": context_text.strip()[:800],
+        "summary": summary,
+    }
+
+
+def separate_content_types(
+    chunk: Element,
+    *,
+    user_id: str | None = None,
+    document_id: str | None = None,
+) -> ContentData:
     """Analyze what kind of content is in a chunk"""
+    chunk_text = extract_chunk_text(chunk)
     content_data: ContentData = {
-        "text": extract_chunk_text(chunk),
+        "text": chunk_text,
         "tables": [],
         "images": [],
         "types": ["text"],
     }
 
     if hasattr(chunk, "metadata") and hasattr(chunk.metadata, "orig_elements"):
+        image_index = 1
         for element in chunk.metadata.orig_elements:
             element_type = type(element).__name__
 
@@ -145,9 +302,20 @@ def separate_content_types(chunk: Element) -> ContentData:
 
             if element_type == "Image":
                 content_data["types"].append("image")
-                image_path = persist_base64_image(element.metadata.image_base64)
+                image_path = persist_base64_image(
+                    element.metadata.image_base64,
+                    user_id=user_id,
+                    document_id=document_id,
+                )
                 if image_path:
-                    content_data["images"].append(image_path)
+                    content_data["images"].append(
+                        build_image_entry(
+                            image_path,
+                            context_text=chunk_text,
+                            image_index=image_index,
+                        )
+                    )
+                    image_index += 1
 
     content_data["types"] = list(set(content_data["types"]))
     return content_data
@@ -179,8 +347,14 @@ def create_ai_enhanced_content(content_data: ContentData):
         table_prompt += f"Table {i + 1}: {table} \n"
 
     image_prompt = "\n IMAGES: \n"
-    for i, image_path in enumerate(images):
-        image_prompt += f"Image {i + 1}: {image_path} \n"
+    for image_entry in images:
+        if not isinstance(image_entry, dict):
+            continue
+        image_prompt += (
+            f"{image_entry.get('image_id', 'image')}: "
+            f"{image_entry.get('summary', 'Document image')} "
+            f"(mime={image_entry.get('mime_type')})\n"
+        )
 
     table_prompt += """
             YOUR TASK:
@@ -205,7 +379,17 @@ def create_ai_enhanced_content(content_data: ContentData):
         }
     )
 
-    return res.content
+    content = res.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = [
+            part.get("text", "").strip()
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return " ".join(part for part in text_parts if part).strip()
+    return str(content)
 
 
 def summarize_chunk(
@@ -214,17 +398,37 @@ def summarize_chunk(
     current_chunk: int,
     total_chunks: int,
     user_id: str | None = None,
+    document_id: str | None = None,
     logger: Callable[[IngestionEvent], None] | None = None,
 ) -> Document:
     emit_log(logger, f"Summarizing chunk {current_chunk}/{total_chunks}")
 
-    content_data = separate_content_types(chunk)
+    content_data = separate_content_types(
+        chunk,
+        user_id=user_id,
+        document_id=document_id,
+    )
 
     emit_log(logger, f"Types found: {content_data['types']}")
     emit_log(
         logger,
         f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}",
     )
+    if content_data["images"]:
+        image_debug = [
+            {
+                "image_id": image.get("image_id"),
+                "path": Path(str(image.get("path", ""))).name,
+                "summary": image.get("summary"),
+            }
+            for image in content_data["images"]
+            if isinstance(image, dict)
+        ]
+        print(
+            f"[RAG Images] chunk {current_chunk}/{total_chunks} extracted: "
+            f"{json.dumps(image_debug, ensure_ascii=True)}",
+            flush=True,
+        )
 
     emit_log(logger, "Creating AI enhance summary")
     tables = content_data.get("tables")
@@ -245,17 +449,22 @@ def summarize_chunk(
             {
                 "raw_text": texts or "",
                 "tables_html": tables or [],
-                "image_paths": images or [],
+                "image_paths": [
+                    image_entry.get("path")
+                    for image_entry in images or []
+                    if isinstance(image_entry, dict) and image_entry.get("path")
+                ],
+                "image_entries": images or [],
             }
         )
     }
     if user_id is not None:
         metadata["user_id"] = user_id
+    if document_id is not None:
+        metadata["document_id"] = document_id
 
-    return Document(
-        page_content=enhanced_content or texts,
-        metadata=metadata,
-    )
+    page_content = enhanced_content if isinstance(enhanced_content, str) else texts
+    return Document(page_content=page_content or texts, metadata=metadata)
 
 
 def summarize_chunks(
@@ -288,6 +497,7 @@ async def stream_ingest_pdf(
     *,
     file_name: str | None = None,
     user_id: str | None = None,
+    document_id: str | None = None,
     storage: PGVectorStore | None = None,
     vector_service: PostgresVectorService | None = None,
     store_name: str = "raggidy_docs",
@@ -353,6 +563,7 @@ async def stream_ingest_pdf(
                 current_chunk=index,
                 total_chunks=total_chunks,
                 user_id=user_id,
+                document_id=document_id,
                 logger=logger,
             )
         )

@@ -8,6 +8,7 @@ def system_model(config: SysConfig) -> ChatOpenAI :
         temperature=0,
         timeout=None,
         max_retries=2,
+        stream_usage=True,
         api_key=SecretStr(config["model"]["api_key"]),
         base_url=config["model"]["base_url"]
     )
@@ -18,6 +19,7 @@ def search_model(config: SysConfig) -> ChatOpenAI:
         temperature=0,
         timeout=None,
         max_retries=2,
+        stream_usage=True,
         api_key=SecretStr(config["model"]["api_key"]),
         base_url=config["model"]["base_url"],
     )

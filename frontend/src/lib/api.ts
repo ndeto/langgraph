@@ -1,14 +1,17 @@
-import { sessionSchema, serverThreadSchema } from "./schemas";
-import { parseChatEventLine, parseIngestionEventLine, streamNdjson } from "./stream";
+import { documentAcceptedSchema, sessionSchema, serverThreadSchema } from "./schemas";
+import { parseChatEventLine, parseIngestionEventLine, streamNdjson, streamSse } from "./stream";
+import { getClientId } from "./clientIdentity";
 import type {
   ChatEvent,
+  DocumentAccepted,
   DocumentSummary,
   IngestionEvent,
   SessionData,
+  ThreadDetail,
   ThreadSummary,
 } from "./types";
 
-const MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024;
+const MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024;
 
 type StreamHandlers = {
   onEvent: (event: ChatEvent) => void;
@@ -59,6 +62,11 @@ function mapSession(payload: ReturnType<typeof sessionSchema.parse>): SessionDat
     userId: payload.user_id,
     expiresAt: payload.expires_at,
     activeDocument,
+    uploadedDocuments: payload.uploaded_documents.map((document) => ({
+      id: document.id,
+      name: document.name,
+      status: document.status as DocumentSummary["status"],
+    })),
     activeThread,
     quota: payload.quota,
   };
@@ -66,9 +74,12 @@ function mapSession(payload: ReturnType<typeof sessionSchema.parse>): SessionDat
 
 async function readError(response: Response): Promise<string> {
   try {
-    const payload = (await response.json()) as { detail?: unknown };
+    const payload = (await response.json()) as { detail?: unknown; message?: unknown };
     if (typeof payload.detail === "string") {
       return payload.detail;
+    }
+    if (typeof payload.message === "string") {
+      return payload.message;
     }
   } catch {
     return `Request failed with status ${response.status}.`;
@@ -85,10 +96,32 @@ function makeLegacyThread(): ThreadSummary {
   };
 }
 
+function buildHeaders(headers?: HeadersInit): HeadersInit {
+  const merged = new Headers(headers);
+  merged.set("X-Atlas-Client-Key", getClientId());
+  return merged;
+}
+
+async function atlasFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return fetch(input, {
+    ...init,
+    headers: buildHeaders(init?.headers),
+    credentials: "same-origin",
+  });
+}
+
 export class AtlasApiClient {
   async getSession(): Promise<SessionData> {
-    const response = await fetch("/api/v1/session", {
-      credentials: "same-origin",
+    const response = await atlasFetch("/api/v1/session");
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+    return mapSession(sessionSchema.parse(await response.json()));
+  }
+
+  async rotateSession(): Promise<SessionData> {
+    const response = await atlasFetch("/api/v1/session/rotate", {
+      method: "POST",
     });
     if (!response.ok) {
       throw new Error(await readError(response));
@@ -98,10 +131,9 @@ export class AtlasApiClient {
 
   async createThread(documentId: string | null = null): Promise<ThreadSummary> {
     try {
-      const response = await fetch("/api/v1/threads", {
+      const response = await atlasFetch("/api/v1/threads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
         body: JSON.stringify(documentId ? { document_id: documentId } : {}),
       });
 
@@ -127,19 +159,45 @@ export class AtlasApiClient {
     }
   }
 
+  async getThread(threadId: string): Promise<ThreadDetail> {
+    const response = await atlasFetch(`/api/v1/threads/${threadId}`);
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+
+    const payload = serverThreadSchema.parse(await response.json());
+    return {
+      id: payload.thread_id ?? payload.id ?? threadId,
+      mode: "server",
+      documentId: payload.document_id ?? null,
+      createdAt: payload.created_at,
+      expiresAt: payload.expires_at,
+      messages: (payload.messages ?? []).map((message) => ({
+        messageId: message.message_id,
+        role: message.role,
+        content: message.content,
+        createdAt: message.created_at,
+        assets: (message.assets ?? []).map((asset) => ({
+          assetId: asset.asset_id,
+          mimeType: asset.mime_type,
+        })),
+        status: message.status ?? "done",
+      })),
+    };
+  }
+
   async streamMessage(
     thread: ThreadSummary,
     userInput: string,
     handlers: StreamHandlers,
   ): Promise<void> {
     if (thread.mode === "server") {
-      const response = await fetch(`/api/v1/threads/${thread.id}/messages`, {
+      const response = await atlasFetch(`/api/v1/threads/${thread.id}/messages`, {
         method: "POST",
         headers: {
           Accept: "application/x-ndjson",
           "Content-Type": "application/json",
         },
-        credentials: "same-origin",
         body: JSON.stringify({ user_input: userInput }),
         signal: handlers.signal,
       });
@@ -163,13 +221,12 @@ export class AtlasApiClient {
     userInput: string,
     handlers: StreamHandlers,
   ): Promise<void> {
-    const response = await fetch("/invoke?stream_format=ndjson", {
+    const response = await atlasFetch("/invoke?stream_format=ndjson", {
       method: "POST",
       headers: {
         Accept: "application/x-ndjson",
         "Content-Type": "application/json",
       },
-      credentials: "same-origin",
       body: JSON.stringify({ user_input: userInput, thread_id: thread.id }),
       signal: handlers.signal,
     });
@@ -181,18 +238,16 @@ export class AtlasApiClient {
     await streamNdjson(response, handlers.onEvent, parseChatEventLine);
   }
 
-  async uploadDocument(file: File, handlers: UploadHandlers): Promise<void> {
+  async uploadDocument(file: File, handlers: UploadHandlers): Promise<DocumentAccepted> {
     if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-      throw new Error("PDF exceeds the 25 MB upload limit.");
+      throw new Error("PDF exceeds the 10 MB upload limit.");
     }
 
     const formData = new FormData();
     formData.append("file", file);
 
-    const response = await fetch("/ingest/pdf?stream_format=ndjson", {
+    const response = await atlasFetch("/api/v1/documents", {
       method: "POST",
-      headers: { Accept: "application/x-ndjson" },
-      credentials: "same-origin",
       body: formData,
       signal: handlers.signal,
     });
@@ -201,7 +256,30 @@ export class AtlasApiClient {
       throw new Error(await readError(response));
     }
 
-    await streamNdjson(response, handlers.onEvent, parseIngestionEventLine);
+    const acceptedPayload = documentAcceptedSchema.parse(await response.json());
+    const accepted: DocumentAccepted = {
+      documentId: acceptedPayload.document_id,
+      jobId: acceptedPayload.job_id,
+      status: acceptedPayload.status,
+    };
+
+    const eventsResponse = await atlasFetch(`/api/v1/ingestions/${accepted.jobId}/events`, {
+      headers: { Accept: "text/event-stream" },
+      signal: handlers.signal,
+    });
+
+    if (!eventsResponse.ok) {
+      throw new Error(await readError(eventsResponse));
+    }
+
+    await streamSse(eventsResponse, handlers.onEvent, (data) =>
+      parseIngestionEventLine(data, {
+        documentId: accepted.documentId,
+        fileName: file.name,
+      }),
+    );
+
+    return accepted;
   }
 }
 

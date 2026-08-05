@@ -27,6 +27,13 @@ export const sessionSchema = z.object({
         .passthrough(),
     ])
     .nullable(),
+  uploaded_documents: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      status: z.string()
+    })
+  ),
   quota: z.object({
     questions: z.object({
       limit: z.number(),
@@ -50,9 +57,37 @@ export const serverThreadSchema = z
   .object({
     thread_id: z.string().optional(),
     id: z.string().optional(),
-    document_id: z.string().nullable().optional()
+    document_id: z.string().nullable().optional(),
+    created_at: z.string().optional(),
+    expires_at: z.string().optional(),
+    messages: z
+      .array(
+        z.object({
+          message_id: z.string(),
+          role: z.enum(["user", "assistant"]),
+          content: z.string(),
+          created_at: z.string(),
+          assets: z
+            .array(
+              z.object({
+                asset_id: z.string(),
+                mime_type: z.string()
+              }),
+            )
+            .nullable()
+            .optional(),
+          status: z.enum(["streaming", "done", "error"]).optional()
+        }),
+      )
+      .optional()
   })
   .passthrough();
+
+export const documentAcceptedSchema = z.object({
+  document_id: z.string(),
+  job_id: z.string(),
+  status: z.string()
+});
 
 export const currentChatEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("status"), text: z.string() }),
@@ -109,5 +144,41 @@ export const currentIngestionEventSchema = z.discriminatedUnion("type", [
     elements: z.number().optional(),
     chunks: z.number().optional(),
     docs: z.number().optional()
+  })
+]);
+
+export const futureIngestionEventSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("queued"),
+    text: z.string().optional()
+  }),
+  z.object({
+    type: z.literal("validating"),
+    text: z.string().optional(),
+    file_name: z.string().optional()
+  }),
+  z.object({
+    type: z.literal("processing"),
+    text: z.string().optional()
+  }),
+  z.object({
+    type: z.literal("storing"),
+    text: z.string().optional(),
+    elements: z.number().optional(),
+    chunks: z.number().optional(),
+    docs: z.number().optional()
+  }),
+  z.object({
+    type: z.literal("ready"),
+    text: z.string().optional(),
+    file_name: z.string().optional(),
+    elements: z.number().optional(),
+    chunks: z.number().optional(),
+    docs: z.number().optional()
+  }),
+  z.object({
+    type: z.literal("failed"),
+    code: z.string().optional(),
+    text: z.string().optional()
   })
 ]);

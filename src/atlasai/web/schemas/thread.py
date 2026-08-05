@@ -4,6 +4,17 @@ from typing import Literal
 from pydantic import BaseModel
 
 
+class ThreadMessageResponse(BaseModel):
+    """Persisted thread message."""
+
+    message_id: str
+    role: str
+    content: str
+    created_at: datetime
+    assets: list[dict[str, str]] | None = None
+    status: str = "done"
+
+
 class ThreadResponse(BaseModel):
     """Thread response."""
 
@@ -11,6 +22,13 @@ class ThreadResponse(BaseModel):
     created_at: datetime
     expires_at: datetime
     document_id: str | None
+    messages: list[ThreadMessageResponse] = []
+
+
+class ThreadCreateRequest(BaseModel):
+    """Thread creation request."""
+
+    document_id: str | None = None
 
 
 class ThreadMessageRequest(BaseModel):

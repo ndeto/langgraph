@@ -55,5 +55,26 @@ describe("stream event parsing", () => {
       state: "processing",
       text: "Preparing upload",
     });
+    expect(
+      parseIngestionEventLine('{"type":"queued","text":"Document queued"}'),
+    ).toEqual({
+      type: "state",
+      state: "uploading",
+      text: "Document queued",
+    });
+    expect(
+      parseIngestionEventLine(
+        '{"type":"ready","text":"Document ready","chunks":14}',
+        { documentId: "doc-1", fileName: "sample.pdf" },
+      ),
+    ).toEqual({
+      type: "done",
+      documentId: "doc-1",
+      fileName: "sample.pdf",
+      elements: undefined,
+      chunks: 14,
+      docs: undefined,
+      text: "Document ready",
+    });
   });
 });

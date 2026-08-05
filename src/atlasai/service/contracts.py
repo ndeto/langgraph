@@ -8,6 +8,8 @@ class InvokePayload(TypedDict):
     user_input: str
     thread_id: str
     user_id: NotRequired[str]
+    document_id: NotRequired[str | None]
+    trace_id: NotRequired[str]
 
 
 class GraphRunner(Protocol):

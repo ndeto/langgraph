@@ -1,6 +1,7 @@
 import {
   currentChatEventSchema,
   currentIngestionEventSchema,
+  futureIngestionEventSchema,
   futureChatEventSchema,
 } from "./schemas";
 import type { ChatEvent, IngestionEvent } from "./types";
@@ -41,6 +42,68 @@ export async function streamNdjson<T>(
   if (trailing) {
     onEvent(mapLine(trailing));
   }
+}
+
+export async function streamSse<T>(
+  response: Response,
+  onEvent: (value: T) => void,
+  mapData: (data: string) => T,
+): Promise<void> {
+  if (!response.body) {
+    throw new Error("Streaming responses are not supported in this browser.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let dataLines: string[] = [];
+
+  function flushEvent() {
+    if (!dataLines.length) {
+      return;
+    }
+    onEvent(mapData(dataLines.join("\n")));
+    dataLines = [];
+  }
+
+  function processLine(line: string) {
+    if (!line) {
+      flushEvent();
+      return;
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+
+    let splitIndex = buffer.indexOf("\n");
+    while (splitIndex !== -1) {
+      const rawLine = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 1);
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      processLine(line);
+
+      splitIndex = buffer.indexOf("\n");
+    }
+
+    if (done) {
+      break;
+    }
+  }
+
+  if (buffer) {
+    const trailingLines = buffer.split("\n");
+    for (const rawLine of trailingLines) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      processLine(line);
+    }
+  }
+  flushEvent();
 }
 
 export function parseChatEventLine(line: string): ChatEvent {
@@ -152,8 +215,62 @@ export function parseChatEventLine(line: string): ChatEvent {
   }
 }
 
-export function parseIngestionEventLine(line: string): IngestionEvent {
+export function parseIngestionEventLine(
+  line: string,
+  context?: { documentId?: string; fileName?: string },
+): IngestionEvent {
   const parsed = JSON.parse(line) as unknown;
+  const future = futureIngestionEventSchema.safeParse(parsed);
+  if (future.success) {
+    switch (future.data.type) {
+      case "queued":
+        return {
+          type: "state",
+          state: "uploading",
+          text: future.data.text ?? "Document queued.",
+        };
+      case "validating":
+        return {
+          type: "state",
+          state: "validating",
+          text:
+            future.data.text ??
+            (future.data.file_name
+              ? `Validating ${future.data.file_name}`
+              : "Validating document."),
+        };
+      case "processing":
+        return {
+          type: "state",
+          state: "processing",
+          text: future.data.text ?? "Processing document.",
+        };
+      case "storing":
+        return {
+          type: "stats",
+          elements: future.data.elements,
+          chunks: future.data.chunks,
+          docs: future.data.docs,
+        };
+      case "ready":
+        return {
+          type: "done",
+          documentId: context?.documentId,
+          fileName: future.data.file_name ?? context?.fileName,
+          elements: future.data.elements,
+          chunks: future.data.chunks,
+          docs: future.data.docs,
+          text: future.data.text,
+        };
+      case "failed":
+        return {
+          type: "error",
+          code: future.data.code,
+          text: future.data.text ?? "Document processing failed.",
+        };
+    }
+  }
+
   const current = currentIngestionEventSchema.parse(parsed);
   switch (current.type) {
     case "file":
@@ -170,6 +287,7 @@ export function parseIngestionEventLine(line: string): IngestionEvent {
     case "done":
       return {
         type: "done",
+        documentId: context?.documentId,
         fileName: current.file_name,
         elements: current.elements,
         chunks: current.chunks,

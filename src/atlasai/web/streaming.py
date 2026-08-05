@@ -60,6 +60,8 @@ def format_structured_ndjson_chunk(chunk: object) -> str | None:
     match chunk_type:
         case "status" | "token" if isinstance(data, str):
             return encode_ndjson_event({"type": chunk_type, "text": data})
+        case "sources" if isinstance(data, list):
+            return encode_ndjson_event({"type": "sources", "assets": data})
         case _:
             return None
 

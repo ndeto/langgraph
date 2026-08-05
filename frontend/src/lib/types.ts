@@ -14,6 +14,7 @@ export type SessionData = {
   userId: string;
   expiresAt: string;
   activeDocument: DocumentSummary | null;
+  uploadedDocuments: DocumentSummary[];
   activeThread: ThreadSummary | null;
   quota: {
     questions: QuotaBucket;
@@ -26,6 +27,21 @@ export type ThreadSummary = {
   id: string;
   mode: "server" | "legacy";
   documentId: string | null;
+};
+
+export type PersistedThreadMessage = {
+  messageId: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  assets: AssetRef[];
+  status: "streaming" | "done" | "error";
+};
+
+export type ThreadDetail = ThreadSummary & {
+  createdAt?: string;
+  expiresAt?: string;
+  messages: PersistedThreadMessage[];
 };
 
 export type DocumentSummary = {
@@ -85,6 +101,12 @@ export type IngestionEvent =
     }
   | { type: "error"; code?: string; text: string };
 
+export type DocumentAccepted = {
+  documentId: string;
+  jobId: string;
+  status: string;
+};
+
 export type SessionState =
   | { status: "loading" }
   | { status: "error"; message: string }
@@ -98,4 +120,3 @@ export type UploadState = {
   document: DocumentSummary | null;
   errorMessage: string | null;
 };
-

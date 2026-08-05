@@ -21,6 +21,7 @@ function mergeTokenUsage(current: SessionData, usage: Partial<TokenUsage>): Sess
 
 export function useSession() {
   const [state, setState] = useState<SessionState>({ status: "loading" });
+  const [isRotating, setIsRotating] = useState(false);
 
   const refresh = useCallback(async () => {
     setState((current) =>
@@ -76,11 +77,23 @@ export function useSession() {
     });
   }, []);
 
+  const rotate = useCallback(async () => {
+    setIsRotating(true);
+    try {
+      const data = await atlasApi.rotateSession();
+      setState({ status: "ready", data });
+      return data;
+    } finally {
+      setIsRotating(false);
+    }
+  }, []);
+
   return {
     state,
     refresh,
+    rotate,
+    isRotating,
     applyUsage,
     decrementQuestionsRemaining,
   };
 }
-

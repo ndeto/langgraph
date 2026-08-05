@@ -1,10 +1,14 @@
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Protocol
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,11 @@ class IngestionJobRecord:
     state: str
     created_at: datetime
     expires_at: datetime
+    source_path: str | None = None
+    attempts: int = 0
+    heartbeat_at: datetime | None = None
+    updated_at: datetime | None = None
+    failure_text: str | None = None
     events: list[IngestionEventRecord] = field(default_factory=list)
 
 
@@ -51,6 +60,7 @@ class DocumentRepository(Protocol):
         filename: str,
         size_bytes: int,
         ttl_seconds: int,
+        source_path: str,
     ) -> tuple[DocumentRecord, IngestionJobRecord]: ...
 
     def get_document(self, *, document_id: str) -> DocumentRecord | None: ...
@@ -59,11 +69,24 @@ class DocumentRepository(Protocol):
 
     def get_active_document(self, *, user_id: str) -> DocumentRecord | None: ...
 
+    def list_documents(self, *, user_id: str) -> list[DocumentRecord]: ...
+
+    def list_user_source_paths(self, *, user_id: str) -> list[str]: ...
+
     def append_event(self, *, job_id: str, payload: dict) -> None: ...
 
     def mark_ready(self, *, job_id: str) -> None: ...
 
     def mark_failed(self, *, job_id: str, text: str) -> None: ...
+
+    def claim_next_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+    ) -> IngestionJobRecord | None: ...
+
+    def heartbeat_job(self, *, job_id: str) -> None: ...
 
 
 class InMemoryDocumentRepository:
@@ -82,6 +105,7 @@ class InMemoryDocumentRepository:
         filename: str,
         size_bytes: int,
         ttl_seconds: int,
+        source_path: str,
     ) -> tuple[DocumentRecord, IngestionJobRecord]:
         with self._lock:
             created_at = datetime.now(UTC)
@@ -102,6 +126,8 @@ class InMemoryDocumentRepository:
                 state="queued",
                 created_at=created_at,
                 expires_at=expires_at,
+                source_path=source_path,
+                updated_at=created_at,
             )
             self._documents[document.document_id] = document
             self._jobs[job.job_id] = job
@@ -123,6 +149,23 @@ class InMemoryDocumentRepository:
             return None
         return self._documents.get(document_id)
 
+    def list_documents(self, *, user_id: str) -> list[DocumentRecord]:
+        return sorted(
+            [
+                document
+                for document in self._documents.values()
+                if document.user_id == user_id
+            ],
+            key=lambda document: document.created_at,
+        )
+
+    def list_user_source_paths(self, *, user_id: str) -> list[str]:
+        return [
+            job.source_path
+            for job in self._jobs.values()
+            if job.user_id == user_id and job.source_path
+        ]
+
     def append_event(self, *, job_id: str, payload: dict) -> None:
         with self._lock:
             self._append_event_locked(job_id=job_id, payload=payload)
@@ -140,10 +183,46 @@ class InMemoryDocumentRepository:
     def mark_failed(self, *, job_id: str, text: str) -> None:
         with self._lock:
             self._set_job_state_locked(job_id=job_id, state="failed")
+            self._jobs[job_id].failure_text = text
             self._append_event_locked(
                 job_id=job_id,
                 payload={"type": "failed", "text": text},
             )
+
+    def claim_next_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+    ) -> IngestionJobRecord | None:
+        with self._lock:
+            stale_before = datetime.now(UTC) - timedelta(
+                seconds=heartbeat_timeout_seconds
+            )
+            for job in self._jobs.values():
+                if job.expires_at <= datetime.now(UTC):
+                    continue
+                if job.state == "queued" or (
+                    job.state == "processing"
+                    and job.heartbeat_at is not None
+                    and job.heartbeat_at < stale_before
+                    and job.attempts < max_attempts
+                ):
+                    now = datetime.now(UTC)
+                    job.state = "processing"
+                    job.attempts += 1
+                    job.heartbeat_at = now
+                    job.updated_at = now
+                    job.failure_text = None
+                    return job
+        return None
+
+    def heartbeat_job(self, *, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            now = datetime.now(UTC)
+            job.heartbeat_at = now
+            job.updated_at = now
 
     def _append_event_locked(self, *, job_id: str, payload: dict) -> None:
         job = self._jobs[job_id]
@@ -154,6 +233,7 @@ class InMemoryDocumentRepository:
     def _set_job_state_locked(self, *, job_id: str, state: str) -> None:
         job = self._jobs[job_id]
         job.state = state
+        job.updated_at = datetime.now(UTC)
         document = self._documents[job.document_id]
         self._documents[job.document_id] = DocumentRecord(
             document_id=document.document_id,
@@ -179,12 +259,14 @@ class DocumentService:
         filename: str,
         size_bytes: int,
         ttl_seconds: int,
+        source_path: str,
     ) -> tuple[DocumentRecord, IngestionJobRecord]:
         return self.repository.create_job(
             user_id=user_id,
             filename=filename,
             size_bytes=size_bytes,
             ttl_seconds=ttl_seconds,
+            source_path=source_path,
         )
 
     def get_owned_job(self, *, user_id: str, job_id: str) -> IngestionJobRecord | None:
@@ -199,6 +281,30 @@ class DocumentService:
             return None
         return document
 
+    def list_documents(self, *, user_id: str) -> list[DocumentRecord]:
+        return [
+            document
+            for document in self.repository.list_documents(user_id=user_id)
+            if document.user_id == user_id
+        ]
+
+    def list_user_source_paths(self, *, user_id: str) -> list[str]:
+        return self.repository.list_user_source_paths(user_id=user_id)
+
+    def claim_next_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+    ) -> IngestionJobRecord | None:
+        return self.repository.claim_next_job(
+            heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+            max_attempts=max_attempts,
+        )
+
+    def heartbeat_job(self, *, job_id: str) -> None:
+        self.repository.heartbeat_job(job_id=job_id)
+
     async def run_job(
         self,
         *,
@@ -206,14 +312,29 @@ class DocumentService:
         file_path: str,
         file_name: str,
         user_id: str | None = None,
+        document_id: str | None = None,
         stream_ingest_pdf,
         storage=None,
+        progress_callback=None,
     ) -> None:
+        resolved_path = Path(file_path)
         try:
+            logger.info(
+                "Starting ingestion job job_id=%s document_id=%s user_id=%s file_name=%s "
+                "file_path=%s exists=%s size_bytes=%s",
+                job_id,
+                document_id,
+                user_id,
+                file_name,
+                resolved_path,
+                resolved_path.exists(),
+                resolved_path.stat().st_size if resolved_path.exists() else "missing",
+            )
             async for event in stream_ingest_pdf(
                 file_path,
                 file_name=file_name,
                 user_id=user_id,
+                document_id=document_id,
                 storage=storage,
                 store_name="raggidy_docs",
             ):
@@ -225,9 +346,28 @@ class DocumentService:
                     "done": "ready",
                 }.get(str(payload.get("type")), str(payload.get("type")))
                 self.repository.append_event(job_id=job_id, payload=payload)
+                if progress_callback is not None:
+                    progress_callback(job_id)
                 await asyncio.sleep(0)
             self.repository.mark_ready(job_id=job_id)
+            logger.info(
+                "Completed ingestion job job_id=%s document_id=%s user_id=%s",
+                job_id,
+                document_id,
+                user_id,
+            )
         except Exception as exc:
+            logger.exception(
+                "Ingestion job failed job_id=%s document_id=%s user_id=%s file_name=%s "
+                "file_path=%s error_type=%s error=%s",
+                job_id,
+                document_id,
+                user_id,
+                file_name,
+                resolved_path,
+                type(exc).__name__,
+                exc,
+            )
             self.repository.mark_failed(job_id=job_id, text=str(exc))
         finally:
             path = Path(file_path)

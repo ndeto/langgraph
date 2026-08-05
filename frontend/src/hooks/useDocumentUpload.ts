@@ -12,6 +12,18 @@ const EMPTY_UPLOAD_STATE: UploadState = {
   errorMessage: null,
 };
 
+function appendLog(logs: string[], text: string | null | undefined): string[] {
+  if (!text) {
+    return logs;
+  }
+
+  if (logs[logs.length - 1] === text) {
+    return logs;
+  }
+
+  return [...logs, text];
+}
+
 export function useDocumentUpload(options: {
   activeDocument: DocumentSummary | null;
   onUploadComplete?: (document: DocumentSummary) => void;
@@ -38,17 +50,24 @@ export function useDocumentUpload(options: {
             ...current,
             status: "uploading",
             fileName: event.fileName,
-            logs: [...current.logs, `Queued ${event.fileName}`],
+            logs: appendLog(current.logs, `Queued ${event.fileName}`),
           };
         case "state":
           return {
             ...current,
-            status: "processing",
-            logs: [...current.logs, event.text],
+            status:
+              event.state === "uploading"
+                ? "uploading"
+                : event.state === "validating"
+                  ? "validating"
+                  : "processing",
+            logs: appendLog(current.logs, event.text),
           };
         case "stats":
           return {
             ...current,
+            status: "processing",
+            logs: appendLog(current.logs, "Storing document artifacts."),
             document: current.document
               ? {
                   ...current.document,
@@ -74,7 +93,7 @@ export function useDocumentUpload(options: {
             ...current,
             status: "ready",
             document,
-            logs: event.text ? [...current.logs, event.text] : current.logs,
+            logs: appendLog(current.logs, event.text),
             errorMessage: null,
           };
         }
@@ -83,7 +102,7 @@ export function useDocumentUpload(options: {
             ...current,
             status: "error",
             errorMessage: event.text,
-            logs: [...current.logs, event.text],
+            logs: appendLog(current.logs, event.text),
           };
       }
     });
@@ -106,16 +125,24 @@ export function useDocumentUpload(options: {
         ...current,
         status: "error",
         errorMessage: error instanceof Error ? error.message : "Upload failed.",
-        logs: [
-          ...current.logs,
+        logs: appendLog(
+          current.logs,
           error instanceof Error ? error.message : "Upload failed.",
-        ],
+        ),
       }));
     }
   }, [applyEvent, options.activeDocument]);
 
+  const resetUpload = useCallback((document: DocumentSummary | null = null) => {
+    setState({
+      ...EMPTY_UPLOAD_STATE,
+      document,
+    });
+  }, []);
+
   return {
     state,
     beginUpload,
+    resetUpload,
   };
 }

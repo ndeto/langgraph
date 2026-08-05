@@ -27,6 +27,14 @@ class SessionQuotaResponse(BaseModel):
     tokens: TokenUsageResponse
 
 
+class SessionDocumentResponse(BaseModel):
+    """Uploaded document summary."""
+
+    id: str
+    name: str
+    status: str
+
+
 class SessionResponse(BaseModel):
     """Anonymous session response."""
 
@@ -34,4 +42,5 @@ class SessionResponse(BaseModel):
     expires_at: datetime
     active_document: str | None
     active_thread: str | None
+    uploaded_documents: list[SessionDocumentResponse]
     quota: SessionQuotaResponse

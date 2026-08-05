@@ -31,6 +31,20 @@ class SessionResolution:
     cookie_value: str
 
 
+@dataclass
+class CleanupJobRecord:
+    """Queued cleanup work for a rotated session."""
+
+    job_id: str
+    user_id: str
+    state: str
+    created_at: datetime
+    updated_at: datetime
+    attempts: int = 0
+    heartbeat_at: datetime | None = None
+    failure_text: str | None = None
+
+
 class SessionRepository(Protocol):
     """Session record access."""
 
@@ -40,12 +54,28 @@ class SessionRepository(Protocol):
 
     def expire_session(self, *, user_id: str) -> None: ...
 
+    def enqueue_cleanup_job(self, *, user_id: str) -> CleanupJobRecord: ...
+
+    def claim_next_cleanup_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+    ) -> CleanupJobRecord | None: ...
+
+    def heartbeat_cleanup_job(self, *, job_id: str) -> None: ...
+
+    def mark_cleanup_job_ready(self, *, job_id: str) -> None: ...
+
+    def mark_cleanup_job_failed(self, *, job_id: str, failure_text: str) -> None: ...
+
 
 class InMemorySessionRepository:
     """In-memory session store."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, AnonymousSession] = {}
+        self._cleanup_jobs: dict[str, CleanupJobRecord] = {}
 
     def get_session(self, *, user_id: str) -> AnonymousSession | None:
         session = self._sessions.get(user_id)
@@ -58,6 +88,86 @@ class InMemorySessionRepository:
 
     def expire_session(self, *, user_id: str) -> None:
         self._sessions.pop(user_id, None)
+
+    def enqueue_cleanup_job(self, *, user_id: str) -> CleanupJobRecord:
+        now = datetime.now(UTC)
+        job = CleanupJobRecord(
+            job_id=str(uuid4()),
+            user_id=user_id,
+            state="queued",
+            created_at=now,
+            updated_at=now,
+        )
+        self._cleanup_jobs[job.job_id] = job
+        return job
+
+    def claim_next_cleanup_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+    ) -> CleanupJobRecord | None:
+        stale_before = datetime.now(UTC) - timedelta(seconds=heartbeat_timeout_seconds)
+        for job in self._cleanup_jobs.values():
+            if job.state == "queued" or (
+                job.state == "processing"
+                and job.heartbeat_at is not None
+                and job.heartbeat_at < stale_before
+                and job.attempts < max_attempts
+            ):
+                now = datetime.now(UTC)
+                claimed = CleanupJobRecord(
+                    job_id=job.job_id,
+                    user_id=job.user_id,
+                    state="processing",
+                    created_at=job.created_at,
+                    updated_at=now,
+                    attempts=job.attempts + 1,
+                    heartbeat_at=now,
+                    failure_text=None,
+                )
+                self._cleanup_jobs[job.job_id] = claimed
+                return claimed
+        return None
+
+    def heartbeat_cleanup_job(self, *, job_id: str) -> None:
+        job = self._cleanup_jobs[job_id]
+        self._cleanup_jobs[job_id] = CleanupJobRecord(
+            job_id=job.job_id,
+            user_id=job.user_id,
+            state=job.state,
+            created_at=job.created_at,
+            updated_at=datetime.now(UTC),
+            attempts=job.attempts,
+            heartbeat_at=datetime.now(UTC),
+            failure_text=job.failure_text,
+        )
+
+    def mark_cleanup_job_ready(self, *, job_id: str) -> None:
+        job = self._cleanup_jobs[job_id]
+        self._cleanup_jobs[job_id] = CleanupJobRecord(
+            job_id=job.job_id,
+            user_id=job.user_id,
+            state="ready",
+            created_at=job.created_at,
+            updated_at=datetime.now(UTC),
+            attempts=job.attempts,
+            heartbeat_at=job.heartbeat_at,
+            failure_text=None,
+        )
+
+    def mark_cleanup_job_failed(self, *, job_id: str, failure_text: str) -> None:
+        job = self._cleanup_jobs[job_id]
+        self._cleanup_jobs[job_id] = CleanupJobRecord(
+            job_id=job.job_id,
+            user_id=job.user_id,
+            state="failed",
+            created_at=job.created_at,
+            updated_at=datetime.now(UTC),
+            attempts=job.attempts,
+            heartbeat_at=job.heartbeat_at,
+            failure_text=failure_text,
+        )
 
 
 class SessionService:
@@ -97,6 +207,18 @@ class SessionService:
         """Serialize session state for cookie storage."""
 
         return self._serialize_cookie(session)
+
+    def resolve_existing_session(
+        self,
+        cookie_value: str | None,
+    ) -> AnonymousSession | None:
+        """Resolve only a currently valid signed session without creating a new one."""
+
+        if not cookie_value:
+            return None
+
+        cookie_session = self._deserialize_cookie(cookie_value)
+        return self._resolve_persisted_session(cookie_session)
 
     def rotate_session(
         self,
@@ -155,9 +277,6 @@ class SessionService:
             return cookie_session
 
         persisted_session = self.repository.get_session(user_id=cookie_session.user_id)
-        if persisted_session is None:
-            self.repository.upsert_session(cookie_session)
-            return cookie_session
         return persisted_session
 
     def _persist_session(self, session: AnonymousSession) -> None:

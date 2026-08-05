@@ -28,8 +28,8 @@ class QuotaSnapshot:
 
 
 @dataclass(frozen=True)
-class RequestKeyQuotaSnapshot:
-    """Current quota counters for a request key."""
+class BucketQuotaSnapshot:
+    """Current quota counters for a quota bucket."""
 
     questions_used: int = 0
     uploads_used: int = 0
@@ -40,7 +40,12 @@ class AdmissionResult:
     """Quota admission result."""
 
     allowed: bool
-    reason: str | None = None
+    code: str | None = None
+    message: str | None = None
+
+    @property
+    def reason(self) -> str | None:
+        return self.message
 
 
 class QuotaRepository(Protocol):
@@ -48,19 +53,26 @@ class QuotaRepository(Protocol):
 
     def get_snapshot(self, *, user_id: str) -> QuotaSnapshot: ...
 
-    def get_request_key_snapshot(
+    def get_client_snapshot(
         self,
         *,
-        request_key: str,
-    ) -> RequestKeyQuotaSnapshot: ...
+        client_key: str,
+    ) -> BucketQuotaSnapshot: ...
+
+    def get_ip_snapshot(
+        self,
+        *,
+        ip_hash: str,
+    ) -> BucketQuotaSnapshot: ...
 
     def claim_question(
         self,
         *,
         user_id: str,
-        request_key: str,
-        user_limit: int,
-        request_key_limit: int,
+        client_key: str,
+        ip_hash: str,
+        client_limit: int,
+        ip_limit: int,
         concurrency_limit: int,
     ) -> AdmissionResult: ...
 
@@ -68,9 +80,10 @@ class QuotaRepository(Protocol):
         self,
         *,
         user_id: str,
-        request_key: str,
-        user_limit: int,
-        request_key_limit: int,
+        client_key: str,
+        ip_hash: str,
+        client_limit: int,
+        ip_limit: int,
         concurrency_limit: int,
     ) -> AdmissionResult: ...
 
@@ -78,79 +91,107 @@ class QuotaRepository(Protocol):
 
     def release_ingestion(self, *, user_id: str) -> None: ...
 
+    def reset_client_bucket(self, *, client_key: str) -> None: ...
+
+    def reset_ip_bucket(self, *, ip_hash: str) -> None: ...
+
 
 class InMemoryQuotaRepository:
     """In-memory quota snapshot store."""
 
     def __init__(self) -> None:
         self._snapshots: dict[str, QuotaSnapshot] = {}
-        self._request_key_snapshots: dict[str, RequestKeyQuotaSnapshot] = {}
+        self._client_snapshots: dict[str, BucketQuotaSnapshot] = {}
+        self._ip_snapshots: dict[str, BucketQuotaSnapshot] = {}
         self._lock = Lock()
 
     def get_snapshot(self, *, user_id: str) -> QuotaSnapshot:
         return self._snapshots.get(user_id, QuotaSnapshot())
 
-    def get_request_key_snapshot(
+    def get_client_snapshot(
         self,
         *,
-        request_key: str,
-    ) -> RequestKeyQuotaSnapshot:
-        return self._request_key_snapshots.get(request_key, RequestKeyQuotaSnapshot())
+        client_key: str,
+    ) -> BucketQuotaSnapshot:
+        return self._client_snapshots.get(client_key, BucketQuotaSnapshot())
+
+    def get_ip_snapshot(
+        self,
+        *,
+        ip_hash: str,
+    ) -> BucketQuotaSnapshot:
+        return self._ip_snapshots.get(ip_hash, BucketQuotaSnapshot())
 
     def set_snapshot(self, *, user_id: str, snapshot: QuotaSnapshot) -> None:
         with self._lock:
             self._snapshots[user_id] = snapshot
 
-    def set_request_key_snapshot(
+    def set_client_snapshot(
         self,
         *,
-        request_key: str,
-        snapshot: RequestKeyQuotaSnapshot,
+        client_key: str,
+        snapshot: BucketQuotaSnapshot,
     ) -> None:
         with self._lock:
-            self._request_key_snapshots[request_key] = snapshot
+            self._client_snapshots[client_key] = snapshot
+
+    def set_ip_snapshot(
+        self,
+        *,
+        ip_hash: str,
+        snapshot: BucketQuotaSnapshot,
+    ) -> None:
+        with self._lock:
+            self._ip_snapshots[ip_hash] = snapshot
 
     def claim_question(
         self,
         *,
         user_id: str,
-        request_key: str,
-        user_limit: int,
-        request_key_limit: int,
+        client_key: str,
+        ip_hash: str,
+        client_limit: int,
+        ip_limit: int,
         concurrency_limit: int,
     ) -> AdmissionResult:
         with self._lock:
             user_snapshot = self._snapshots.get(user_id, QuotaSnapshot())
-            request_key_snapshot = self._request_key_snapshots.get(
-                request_key,
-                RequestKeyQuotaSnapshot(),
+            client_snapshot = self._client_snapshots.get(
+                client_key,
+                BucketQuotaSnapshot(),
             )
+            ip_snapshot = self._ip_snapshots.get(ip_hash, BucketQuotaSnapshot())
 
-            if user_snapshot.questions_used >= user_limit:
+            if client_snapshot.questions_used >= client_limit:
                 return AdmissionResult(
                     allowed=False,
-                    reason="Question quota exceeded.",
+                    code="browser_question_quota_reached",
+                    message="Question quota reached for this browser session.",
                 )
-            if request_key_snapshot.questions_used >= request_key_limit:
+            if ip_snapshot.questions_used >= ip_limit:
                 return AdmissionResult(
                     allowed=False,
-                    reason="Question quota exceeded for this request key.",
+                    code="network_question_quota_reached",
+                    message="Question quota reached for this network.",
                 )
             if user_snapshot.active_agent_runs >= concurrency_limit:
                 return AdmissionResult(
                     allowed=False,
-                    reason="Another agent run is already in progress.",
+                    code="agent_run_in_progress",
+                    message="Another agent run is already in progress.",
                 )
 
             self._snapshots[user_id] = QuotaSnapshot(
-                questions_used=user_snapshot.questions_used + 1,
-                uploads_used=user_snapshot.uploads_used,
                 active_ingestions=user_snapshot.active_ingestions,
                 active_agent_runs=user_snapshot.active_agent_runs + 1,
             )
-            self._request_key_snapshots[request_key] = RequestKeyQuotaSnapshot(
-                questions_used=request_key_snapshot.questions_used + 1,
-                uploads_used=request_key_snapshot.uploads_used,
+            self._client_snapshots[client_key] = BucketQuotaSnapshot(
+                questions_used=client_snapshot.questions_used + 1,
+                uploads_used=client_snapshot.uploads_used,
+            )
+            self._ip_snapshots[ip_hash] = BucketQuotaSnapshot(
+                questions_used=ip_snapshot.questions_used + 1,
+                uploads_used=ip_snapshot.uploads_used,
             )
             return AdmissionResult(allowed=True)
 
@@ -158,43 +199,50 @@ class InMemoryQuotaRepository:
         self,
         *,
         user_id: str,
-        request_key: str,
-        user_limit: int,
-        request_key_limit: int,
+        client_key: str,
+        ip_hash: str,
+        client_limit: int,
+        ip_limit: int,
         concurrency_limit: int,
     ) -> AdmissionResult:
         with self._lock:
             user_snapshot = self._snapshots.get(user_id, QuotaSnapshot())
-            request_key_snapshot = self._request_key_snapshots.get(
-                request_key,
-                RequestKeyQuotaSnapshot(),
+            client_snapshot = self._client_snapshots.get(
+                client_key,
+                BucketQuotaSnapshot(),
             )
+            ip_snapshot = self._ip_snapshots.get(ip_hash, BucketQuotaSnapshot())
 
-            if user_snapshot.uploads_used >= user_limit:
+            if client_snapshot.uploads_used >= client_limit:
                 return AdmissionResult(
                     allowed=False,
-                    reason="Upload quota exceeded.",
+                    code="browser_upload_quota_reached",
+                    message="Upload quota reached for this browser session.",
                 )
-            if request_key_snapshot.uploads_used >= request_key_limit:
+            if ip_snapshot.uploads_used >= ip_limit:
                 return AdmissionResult(
                     allowed=False,
-                    reason="Upload quota exceeded for this request key.",
+                    code="network_upload_quota_reached",
+                    message="Upload quota reached for this network.",
                 )
             if user_snapshot.active_ingestions >= concurrency_limit:
                 return AdmissionResult(
                     allowed=False,
-                    reason="Another document ingestion is already in progress.",
+                    code="ingestion_in_progress",
+                    message="Another document is still processing.",
                 )
 
             self._snapshots[user_id] = QuotaSnapshot(
-                questions_used=user_snapshot.questions_used,
-                uploads_used=user_snapshot.uploads_used + 1,
                 active_ingestions=user_snapshot.active_ingestions + 1,
                 active_agent_runs=user_snapshot.active_agent_runs,
             )
-            self._request_key_snapshots[request_key] = RequestKeyQuotaSnapshot(
-                questions_used=request_key_snapshot.questions_used,
-                uploads_used=request_key_snapshot.uploads_used + 1,
+            self._client_snapshots[client_key] = BucketQuotaSnapshot(
+                questions_used=client_snapshot.questions_used,
+                uploads_used=client_snapshot.uploads_used + 1,
+            )
+            self._ip_snapshots[ip_hash] = BucketQuotaSnapshot(
+                questions_used=ip_snapshot.questions_used,
+                uploads_used=ip_snapshot.uploads_used + 1,
             )
             return AdmissionResult(allowed=True)
 
@@ -202,8 +250,6 @@ class InMemoryQuotaRepository:
         with self._lock:
             snapshot = self._snapshots.get(user_id, QuotaSnapshot())
             self._snapshots[user_id] = QuotaSnapshot(
-                questions_used=snapshot.questions_used,
-                uploads_used=snapshot.uploads_used,
                 active_ingestions=snapshot.active_ingestions,
                 active_agent_runs=max(snapshot.active_agent_runs - 1, 0),
             )
@@ -212,11 +258,17 @@ class InMemoryQuotaRepository:
         with self._lock:
             snapshot = self._snapshots.get(user_id, QuotaSnapshot())
             self._snapshots[user_id] = QuotaSnapshot(
-                questions_used=snapshot.questions_used,
-                uploads_used=snapshot.uploads_used,
                 active_ingestions=max(snapshot.active_ingestions - 1, 0),
                 active_agent_runs=snapshot.active_agent_runs,
             )
+
+    def reset_client_bucket(self, *, client_key: str) -> None:
+        with self._lock:
+            self._client_snapshots[client_key] = BucketQuotaSnapshot()
+
+    def reset_ip_bucket(self, *, ip_hash: str) -> None:
+        with self._lock:
+            self._ip_snapshots[ip_hash] = BucketQuotaSnapshot()
 
 
 class QuotaService:
@@ -226,26 +278,30 @@ class QuotaService:
         self,
         policy: QuotaPolicy,
         repository: QuotaRepository,
-        request_key: str | None = None,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> None:
         self.policy = policy
         self.repository = repository
-        self.request_key = request_key
+        self.client_key = client_key
+        self.ip_hash = ip_hash
 
     def claim_question(
         self,
         *,
         user_id: str,
-        request_key: str | None = None,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> AdmissionResult:
         return self.repository.claim_question(
             user_id=user_id,
-            request_key=self._resolve_request_key(
+            client_key=self._resolve_client_key(
                 user_id=user_id,
-                request_key=request_key,
+                client_key=client_key,
             ),
-            user_limit=self.policy.user_question_limit,
-            request_key_limit=self.policy.ip_question_limit,
+            ip_hash=self._resolve_ip_hash(ip_hash=ip_hash),
+            client_limit=self.policy.user_question_limit,
+            ip_limit=self.policy.ip_question_limit,
             concurrency_limit=self.policy.concurrent_agent_runs_per_user,
         )
 
@@ -253,16 +309,18 @@ class QuotaService:
         self,
         *,
         user_id: str,
-        request_key: str | None = None,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> AdmissionResult:
         return self.repository.claim_upload(
             user_id=user_id,
-            request_key=self._resolve_request_key(
+            client_key=self._resolve_client_key(
                 user_id=user_id,
-                request_key=request_key,
+                client_key=client_key,
             ),
-            user_limit=self.policy.user_upload_limit,
-            request_key_limit=self.policy.ip_upload_limit,
+            ip_hash=self._resolve_ip_hash(ip_hash=ip_hash),
+            client_limit=self.policy.user_upload_limit,
+            ip_limit=self.policy.ip_upload_limit,
             concurrency_limit=self.policy.concurrent_ingestions_per_user,
         )
 
@@ -278,18 +336,23 @@ class QuotaService:
         user_id: str,
         token_usage: TokenUsageSummary,
     ) -> SessionQuotaSummary:
-        snapshot = self.repository.get_snapshot(user_id=user_id)
+        client_snapshot = self.repository.get_client_snapshot(
+            client_key=self._resolve_client_key(user_id=user_id, client_key=None)
+        )
         return SessionQuotaSummary(
             questions=QuotaBucket(
                 limit=self.policy.user_question_limit,
-                used=snapshot.questions_used,
+                used=client_snapshot.questions_used,
             ),
             uploads=QuotaBucket(
                 limit=self.policy.user_upload_limit,
-                used=snapshot.uploads_used,
+                used=client_snapshot.uploads_used,
             ),
             tokens=token_usage,
         )
 
-    def _resolve_request_key(self, *, user_id: str, request_key: str | None) -> str:
-        return request_key or self.request_key or user_id
+    def _resolve_client_key(self, *, user_id: str, client_key: str | None) -> str:
+        return client_key or self.client_key or user_id
+
+    def _resolve_ip_hash(self, *, ip_hash: str | None) -> str:
+        return ip_hash or self.ip_hash or "unknown-network"

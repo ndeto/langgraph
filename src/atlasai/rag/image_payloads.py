@@ -1,10 +1,27 @@
 import base64
 import binascii
 import mimetypes
+import tempfile
 import uuid
 from pathlib import Path
 
-IMAGE_OUTPUT_DIR = Path("tmp/extracted_images")
+IMAGE_OUTPUT_DIR = Path(tempfile.gettempdir()) / "atlasai" / "extracted_images"
+
+
+def build_image_output_dir(
+    *,
+    user_id: str | None = None,
+    document_id: str | None = None,
+    output_dir: Path = IMAGE_OUTPUT_DIR,
+) -> Path:
+    """Build a deterministic image output directory for one user/document."""
+
+    target_dir = output_dir
+    if user_id:
+        target_dir = target_dir / user_id
+    if document_id:
+        target_dir = target_dir / document_id
+    return target_dir
 
 
 def build_data_url(mime_type: str, payload: bytes) -> str:
@@ -14,12 +31,21 @@ def build_data_url(mime_type: str, payload: bytes) -> str:
 
 
 def persist_base64_image(
-    image_base64: str, output_dir: Path = IMAGE_OUTPUT_DIR
+    image_base64: str,
+    output_dir: Path = IMAGE_OUTPUT_DIR,
+    *,
+    user_id: str | None = None,
+    document_id: str | None = None,
 ) -> str | None:
     """Write a base64 image payload to disk and return the file path."""
     if not image_base64:
         return None
 
+    output_dir = build_image_output_dir(
+        user_id=user_id,
+        document_id=document_id,
+        output_dir=output_dir,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     image_path = output_dir / f"{uuid.uuid4()}.png"
 

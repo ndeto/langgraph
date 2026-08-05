@@ -1,4 +1,5 @@
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -36,6 +37,9 @@ class DemoWebSettings:
     ip_upload_limit: int
     concurrent_ingestions_per_user: int
     concurrent_agent_runs_per_user: int
+    staging_dir: str
+    ip_hash_secret: str
+    trusted_proxies: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,22 @@ def load_demo_web_settings() -> DemoWebSettings:
         ),
         concurrent_agent_runs_per_user=int(
             os.getenv("ATLAS_DEMO_CONCURRENT_AGENT_RUNS", "1")
+        ),
+        staging_dir=os.getenv(
+            "ATLASAI_STAGING_DIR",
+            str(
+                os.path.join(
+                    tempfile.gettempdir(),
+                    "atlasai",
+                    "staged_uploads",
+                )
+            ),
+        ),
+        ip_hash_secret=os.getenv("IP_HASH_SECRET", "atlas-demo-ip-dev-secret"),
+        trusted_proxies=tuple(
+            proxy.strip()
+            for proxy in os.getenv("ATLAS_DEMO_TRUSTED_PROXIES", "").split(",")
+            if proxy.strip()
         ),
     )
 
@@ -123,12 +143,14 @@ def get_request_key(request: Request) -> str:
     request_key = getattr(request.state, "request_key_hash", None)
     if isinstance(request_key, str) and request_key:
         return request_key
+    return "unknown-network"
 
-    header_value = request.headers.get("x-atlas-request-key")
+
+def get_client_key(request: Request) -> str:
+    header_value = request.headers.get("x-atlas-client-key")
     if header_value:
         return header_value
-
-    return "anonymous"
+    return "anonymous-browser"
 
 
 def get_quota_service(
@@ -136,12 +158,14 @@ def get_quota_service(
     repositories: Annotated[
         PostgresRepositoryBundle | InMemoryRepositoryBundle, Depends(get_repositories)
     ],
+    client_key: Annotated[str, Depends(get_client_key)],
     request_key: Annotated[str, Depends(get_request_key)],
 ) -> QuotaService:
     return QuotaService(
         policy=policy,
         repository=repositories.quotas,
-        request_key=request_key,
+        client_key=client_key,
+        ip_hash=request_key,
     )
 
 
