@@ -3,7 +3,7 @@ import asyncio
 from langchain_postgres import PGVectorStore
 from langchain_unstructured import UnstructuredLoader
 
-from atlasai.store.hybrid_store import get_or_create_store
+from atlasai.store.hybrid_store import PostgresVectorService
 
 
 class WebsiteRAG:
@@ -13,10 +13,10 @@ class WebsiteRAG:
         print(f"\n Initilized with {websites}! \n")
 
     async def rag_sites(self):
-        for l in self.websites:
-            print(f"Ragging {l} \n")
+        for website in self.websites:
+            print(f"Ragging {website} \n")
             docs = UnstructuredLoader(
-                web_url=l,
+                web_url=website,
                 chunking_strategy="by_title",
                 max_characters=3000,
                 new_after_n_chars=2400,
@@ -24,21 +24,24 @@ class WebsiteRAG:
                 include_orig_elements=True,
             ).load()
 
-            print(f"{len(docs)} docs found for {l} \n")
+            print(f"{len(docs)} docs found for {website} \n")
 
             await self.store.aadd_documents(docs)
 
-            print(f"Done for {l}\n")
+            print(f"Done for {website}\n")
 
 
 async def main():
     links = ["https://ndeto.eth.limo"]
+    vector_service = PostgresVectorService(table_names=("websites",))
+    await vector_service.startup()
 
-    store = await get_or_create_store("websites")
-
-    ragger = WebsiteRAG(websites=links, store=store)
-    
-    await ragger.rag_sites()
+    try:
+        store = vector_service.get_store("websites")
+        ragger = WebsiteRAG(websites=links, store=store)
+        await ragger.rag_sites()
+    finally:
+        await vector_service.shutdown()
 
 
 if __name__ == "__main__":

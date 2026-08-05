@@ -15,7 +15,7 @@ from unstructured.partition.pdf import partition_pdf
 
 from atlasai.config.sys_config import SysConfig, bootstrap_config
 from atlasai.rag.image_payloads import persist_base64_image
-from atlasai.store.hybrid_store import get_or_create_store
+from atlasai.store.hybrid_store import PostgresVectorService
 
 config: SysConfig = bootstrap_config()
 
@@ -213,6 +213,7 @@ def summarize_chunk(
     *,
     current_chunk: int,
     total_chunks: int,
+    user_id: str | None = None,
     logger: Callable[[IngestionEvent], None] | None = None,
 ) -> Document:
     emit_log(logger, f"Summarizing chunk {current_chunk}/{total_chunks}")
@@ -239,17 +240,21 @@ def summarize_chunk(
         emit_log(logger, "Using raw text, no images and tables found")
         enhanced_content = content_data["text"] or ""
 
+    metadata = {
+        "original_content": json.dumps(
+            {
+                "raw_text": texts or "",
+                "tables_html": tables or [],
+                "image_paths": images or [],
+            }
+        )
+    }
+    if user_id is not None:
+        metadata["user_id"] = user_id
+
     return Document(
         page_content=enhanced_content or texts,
-        metadata={
-            "original_content": json.dumps(
-                {
-                    "raw_text": texts or "",
-                    "tables_html": tables or [],
-                    "image_paths": images or [],
-                }
-            )
-        },
+        metadata=metadata,
     )
 
 
@@ -282,6 +287,9 @@ async def stream_ingest_pdf(
     path: str | Path,
     *,
     file_name: str | None = None,
+    user_id: str | None = None,
+    storage: PGVectorStore | None = None,
+    vector_service: PostgresVectorService | None = None,
     store_name: str = "raggidy_docs",
 ) -> AsyncIterator[IngestionEvent]:
     resolved_path = Path(path)
@@ -299,9 +307,12 @@ async def stream_ingest_pdf(
         docs=0,
     )
     emit_log(logger, f"Preparing ingestion for {resolved_name}")
-    emit_log(logger, f"Initializing store: {store_name}")
-    storage: PGVectorStore = await get_or_create_store(store_name)
-    emit_log(logger, "Store initialized")
+    if storage is None:
+        if vector_service is None:
+            raise RuntimeError("Vector service must be initialized before ingestion.")
+        emit_log(logger, f"Using warmed store: {store_name}")
+        storage = vector_service.get_store(store_name)
+        emit_log(logger, "Store ready")
 
     while event_queue:
         yield event_queue.pop(0)
@@ -341,6 +352,7 @@ async def stream_ingest_pdf(
                 chunk,
                 current_chunk=index,
                 total_chunks=total_chunks,
+                user_id=user_id,
                 logger=logger,
             )
         )
@@ -380,10 +392,19 @@ async def stream_ingest_pdf(
 
 async def main():
     docs = ["attention.pdf", "cv.pdf"]
+    vector_service = PostgresVectorService(table_names=("raggidy_docs",))
+    await vector_service.startup()
 
-    for d in docs:
-        async for _ in stream_ingest_pdf(d, file_name=d):
-            pass
+    try:
+        for d in docs:
+            async for _ in stream_ingest_pdf(
+                d,
+                file_name=d,
+                vector_service=vector_service,
+            ):
+                pass
+    finally:
+        await vector_service.shutdown()
 
 
 if __name__ == "__main__":

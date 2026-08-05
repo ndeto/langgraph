@@ -36,10 +36,12 @@ dependencies = [
     "langmem>=0.0.30",
     "langchain-community>=0.4.2",
     "langchain-cohere>=0.6.0",
+    "psycopg2-binary>=2.9.12",
 ]
 
 [dependency-groups]
 dev = [
+    "alembic>=1.18.5",
     "httpx2>=2.9.1",
     "pyright>=1.1.411",
     "ruff>=0.15.21",

@@ -3,14 +3,13 @@ import json
 import os
 import tracemalloc
 from collections.abc import AsyncIterator
-from typing import Protocol
 
 import requests
 from langchain.messages import HumanMessage, RemoveMessage, SystemMessage, trim_messages
+from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
 from langchain.tools import BaseTool, tool
 from langchain_classic.prompts import PromptTemplate
 from langchain_core.runnables.config import RunnableConfig
-from langchain_postgres import PGVectorStore
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -34,26 +33,13 @@ from atlasai.rag.utils import (
     build_document_context_prompt,
     build_retrieved_image_markdown,
 )
-from atlasai.store import get_or_create_store, tool_store
+from atlasai.service.contracts import GraphRunner, InvokePayload
+from atlasai.store import PostgresVectorService, tool_store
 from atlasai.tools import math_tools
 from atlasai.util.utils import load_file
 
 if not tracemalloc.is_tracing():
     tracemalloc.start(25)
-
-
-class InvokePayload(TypedDict):
-    user_input: str
-    thread_id: str
-
-
-class GraphRunner(Protocol):
-    """Streaming interface for graph-based request execution."""
-
-    def stream(
-        self,
-        payload: InvokePayload,
-    ) -> AsyncIterator[object]: ...
 
 
 class GraphService(GraphRunner):
@@ -63,8 +49,14 @@ class GraphService(GraphRunner):
     tools_list: list[BaseTool] = []
     get_crypto_prices: BaseTool
 
-    def __init__(self, config: SysConfig) -> None:
+    def __init__(
+        self,
+        config: SysConfig,
+        *,
+        vector_service: PostgresVectorService,
+    ) -> None:
         self.sys_config = config
+        self.vector_service = vector_service
         self.get_crypto_prices = self.CryptoPriceTool(config)
         self.tool_retriever = tool_store(self.tools_list).as_retriever(
             search_kwargs={"k": 5}
@@ -77,10 +69,10 @@ class GraphService(GraphRunner):
         @tool
         async def search_user_info(query: str):
             """Search indexed websites for a named person's biography or professional details. Use for questions like 'Who is X?' or 'What does X do?'"""
-            store: PGVectorStore = await get_or_create_store("websites")
-            res = await store.asimilarity_search(query)
-
-            return res
+            return await self.vector_service.asimilarity_search(
+                table_name="websites",
+                query=query,
+            )
 
         self.tools_list = [
             search_user_info,
@@ -106,6 +98,7 @@ class GraphService(GraphRunner):
 
         await self.checkpointer.setup()
         await self.pg_store.setup()
+        self.store = self.pg_store
 
         self.graph = self.build_main_graph().compile(
             checkpointer=self.checkpointer, store=self.store
@@ -199,9 +192,13 @@ class GraphService(GraphRunner):
         instruction_prompt = self.sys_config.get("user_instruction_prompt")
         system_instruction = f"Available Tools: {state.get('resolved_tools')}"
         user_input = state.get("user_input") or ""
+        user_id = state.get("user_id")
 
-        rag_store = await get_or_create_store("raggidy_docs")
-        rag_res = await rag_store.asimilarity_search(user_input)
+        rag_res = await self.vector_service.asimilarity_search(
+            table_name="raggidy_docs",
+            query=user_input,
+            filter={"user_id": user_id} if user_id else None,
+        )
 
         rag_context = build_document_context_prompt(
             user_input, rag_res, "knowledge-base"
@@ -244,16 +241,38 @@ class GraphService(GraphRunner):
         llm_status = "[Atlas AI] LLM is working..."
         print(llm_status, flush=True)
         runtime.stream_writer({"type": "status", "data": llm_status})
-        response = await llm.bind_tools(tools).ainvoke(trimmed_messages)
+        usage_callback = UsageMetadataCallbackHandler()
+        response = await llm.bind_tools(tools).ainvoke(
+            trimmed_messages,
+            config={"callbacks": [usage_callback]},
+        )
 
         for tool_call in response.tool_calls:
             tool_status = f"[Atlas AI] Calling tool: {tool_call['name']}"
             print(tool_status, flush=True)
             runtime.stream_writer({"type": "status", "data": tool_status})
 
+        usage_payload = None
+        response_usage_metadata = getattr(response, "usage_metadata", None)
+        if response_usage_metadata:
+            usage_payload = {
+                "model_name": getattr(response, "response_metadata", {}).get(
+                    "model_name",
+                    getattr(response, "model_name", None),
+                ),
+                "usage_metadata": response_usage_metadata,
+            }
+        elif usage_callback.usage_metadata:
+            model_name, usage_metadata = next(iter(usage_callback.usage_metadata.items()))
+            usage_payload = {
+                "model_name": model_name,
+                "usage_metadata": usage_metadata,
+            }
+
         return {
             "messages": [response],
             "rag_image_markdown": rag_image_markdown or None,
+            "usage_payload": usage_payload,
         }
 
     def prune_messages_node(self, state: StateContext):
@@ -420,6 +439,7 @@ class GraphService(GraphRunner):
         try:
             current_state: StateContext = {
                 "user_input": query,
+                "user_id": payload.get("user_id"),
                 "messages": [HumanMessage(content=query)],
             }
             thread_id = payload.get("thread_id")

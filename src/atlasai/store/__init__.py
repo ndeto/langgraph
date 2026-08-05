@@ -1,4 +1,4 @@
-from .hybrid_store import get_or_create_store
+from .hybrid_store import PostgresVectorService
 from .tool_retriever import tool_store
 
-__all__ = ["get_or_create_store", "tool_store"]
+__all__ = ["PostgresVectorService", "tool_store"]

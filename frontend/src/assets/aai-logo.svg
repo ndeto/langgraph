@@ -1,0 +1,46 @@
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1200" xml:space="preserve" role="img" aria-label="Atlas AI logo">
+  <g id="Graphic_element">
+    <g>
+      <linearGradient id="aai-orbit-lower" gradientUnits="userSpaceOnUse" x1="494.2029" y1="585.0129" x2="704.2661" y2="948.8529">
+        <stop offset="0.1069" style="stop-color:#006EDD;stop-opacity:0"/>
+        <stop offset="0.3868" style="stop-color:#006EDD"/>
+        <stop offset="0.4796" style="stop-color:#0063C8"/>
+        <stop offset="0.6381" style="stop-color:#004A99"/>
+        <stop offset="0.8416" style="stop-color:#002E66"/>
+        <stop offset="1" style="stop-color:#001A3D"/>
+      </linearGradient>
+      <path style="fill:url(#aai-orbit-lower);" d="M875.571,758.312l-3.116,5.069c-27.479,44.718-66.075,82.116-111.615,108.151
+        c-46.924,26.827-100.48,41.008-154.876,41.008c-65.739,0-128.627-20.171-181.866-58.332
+        c-52.13-37.367-91.042-88.886-112.526-148.989l-2.003-5.602l-36.413,13.017l2.002,5.602
+        c24.144,67.545,67.857,125.431,126.411,167.402c59.848,42.898,130.528,65.573,204.395,65.573
+        c61.116,0,121.308-15.944,174.07-46.106c51.154-29.244,94.505-71.25,125.37-121.479l3.114-5.068L875.571,758.312z"/>
+
+      <linearGradient id="aai-orbit-upper" gradientUnits="userSpaceOnUse" x1="605.9642" y1="688.6089" x2="605.9642" y2="248.7889">
+        <stop offset="0.0465" style="stop-color:#006EDD;stop-opacity:0"/>
+        <stop offset="0.0957" style="stop-color:#006EDD;stop-opacity:0.1447"/>
+        <stop offset="0.3868" style="stop-color:#006EDD"/>
+        <stop offset="0.4796" style="stop-color:#0063C8"/>
+        <stop offset="0.6381" style="stop-color:#004A99"/>
+        <stop offset="0.8416" style="stop-color:#002E66"/>
+        <stop offset="1" style="stop-color:#001A3D"/>
+      </linearGradient>
+      <path style="fill:url(#aai-orbit-upper);" d="M854.308,351.657
+        c-66.335-66.335-154.531-102.868-248.344-102.868c-93.813,0-182.01,36.533-248.344,102.868
+        C291.285,417.99,254.753,506.188,254.753,600v5.949h38.671V600c0-83.482,32.509-161.968,91.541-221
+        c59.031-59.031,137.516-91.54,220.999-91.54c83.482,0,161.967,32.509,220.999,91.54c59.032,59.03,91.542,137.517,91.542,221
+        c0,24.933-2.941,49.743-8.744,73.737l-1.399,5.784l37.589,9.088l1.397-5.782c6.522-26.968,9.827-54.836,9.827-82.827
+        C957.176,506.188,920.643,417.992,854.308,351.657z"/>
+
+      <linearGradient id="aai-arrow" gradientUnits="userSpaceOnUse" x1="600" y1="854.3826" x2="600" y2="345.6174">
+        <stop offset="0" style="stop-color:#006EDD"/>
+        <stop offset="0.1326" style="stop-color:#005EC0"/>
+        <stop offset="0.5352" style="stop-color:#003E86"/>
+        <stop offset="0.8364" style="stop-color:#002758"/>
+        <stop offset="1" style="stop-color:#001A3D"/>
+      </linearGradient>
+      <path style="fill:url(#aai-arrow);" d="M632.137,658.943V345.617
+        L179.521,798.235l27.344,27.346l386.602-386.604v219.966H436.7l195.437,195.439V697.614h388.342v-38.671H632.137z
+         M593.466,697.614v63.405l-63.406-63.405H593.466z"/>
+    </g>
+  </g>
+</svg>

@@ -101,6 +101,12 @@ DB_CONN=postgresql://atlasai:atlasai@localhost:55433/atlasai
 PGVECTOR_CONNECTION=postgresql+psycopg://atlasai:atlasai@localhost:55433/atlasai
 ```
 
+Run database migrations:
+
+```bash
+uv run alembic upgrade head
+```
+
 ## Running
 
 Start the app:
