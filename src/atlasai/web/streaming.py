@@ -1,9 +1,41 @@
+import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Literal
 
 from atlasai.application.usage import UsageRecord
 
 StreamFormat = Literal["text", "ndjson"]
+NDJSON_KEEPALIVE_SECONDS = 14.0
+
+
+async def stream_with_keepalive(
+    source: AsyncIterator[str],
+    *,
+    interval_seconds: float = NDJSON_KEEPALIVE_SECONDS,
+) -> AsyncIterator[str]:
+    """Emit ignorable blank NDJSON lines while the source is silent."""
+
+    iterator = source.__aiter__()
+    pending = asyncio.ensure_future(anext(iterator))
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=interval_seconds)
+            if not done:
+                yield "\n"
+                continue
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            yield item
+            pending = asyncio.ensure_future(anext(iterator))
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
 
 
 def format_graph_chunk(chunk: object, stream_format: StreamFormat) -> str | None:

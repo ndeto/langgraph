@@ -47,6 +47,8 @@ class IngestionJobRecord:
     heartbeat_at: datetime | None = None
     updated_at: datetime | None = None
     failure_text: str | None = None
+    client_key: str | None = None
+    ip_hash: str | None = None
     events: list[IngestionEventRecord] = field(default_factory=list)
 
 
@@ -61,6 +63,8 @@ class DocumentRepository(Protocol):
         size_bytes: int,
         ttl_seconds: int,
         source_path: str,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> tuple[DocumentRecord, IngestionJobRecord]: ...
 
     def get_document(self, *, document_id: str) -> DocumentRecord | None: ...
@@ -78,6 +82,8 @@ class DocumentRepository(Protocol):
     def mark_ready(self, *, job_id: str) -> None: ...
 
     def mark_failed(self, *, job_id: str, text: str) -> None: ...
+
+    def mark_retry(self, *, job_id: str, text: str) -> None: ...
 
     def claim_next_job(
         self,
@@ -106,6 +112,8 @@ class InMemoryDocumentRepository:
         size_bytes: int,
         ttl_seconds: int,
         source_path: str,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> tuple[DocumentRecord, IngestionJobRecord]:
         with self._lock:
             created_at = datetime.now(UTC)
@@ -128,6 +136,8 @@ class InMemoryDocumentRepository:
                 expires_at=expires_at,
                 source_path=source_path,
                 updated_at=created_at,
+                client_key=client_key,
+                ip_hash=ip_hash,
             )
             self._documents[document.document_id] = document
             self._jobs[job.job_id] = job
@@ -187,6 +197,18 @@ class InMemoryDocumentRepository:
             self._append_event_locked(
                 job_id=job_id,
                 payload={"type": "failed", "text": text},
+            )
+
+    def mark_retry(self, *, job_id: str, text: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            job.state = "queued"
+            job.heartbeat_at = None
+            job.updated_at = datetime.now(UTC)
+            job.failure_text = text
+            self._append_event_locked(
+                job_id=job_id,
+                payload={"type": "processing", "text": "Retrying ingestion."},
             )
 
     def claim_next_job(
@@ -260,6 +282,8 @@ class DocumentService:
         size_bytes: int,
         ttl_seconds: int,
         source_path: str,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> tuple[DocumentRecord, IngestionJobRecord]:
         return self.repository.create_job(
             user_id=user_id,
@@ -267,6 +291,8 @@ class DocumentService:
             size_bytes=size_bytes,
             ttl_seconds=ttl_seconds,
             source_path=source_path,
+            client_key=client_key,
+            ip_hash=ip_hash,
         )
 
     def get_owned_job(self, *, user_id: str, job_id: str) -> IngestionJobRecord | None:
@@ -305,6 +331,9 @@ class DocumentService:
     def heartbeat_job(self, *, job_id: str) -> None:
         self.repository.heartbeat_job(job_id=job_id)
 
+    def retry_job(self, *, job_id: str, text: str) -> None:
+        self.repository.mark_retry(job_id=job_id, text=text)
+
     async def run_job(
         self,
         *,
@@ -315,6 +344,7 @@ class DocumentService:
         document_id: str | None = None,
         stream_ingest_pdf,
         storage=None,
+        asset_repository=None,
         progress_callback=None,
     ) -> None:
         resolved_path = Path(file_path)
@@ -336,6 +366,7 @@ class DocumentService:
                 user_id=user_id,
                 document_id=document_id,
                 storage=storage,
+                asset_repository=asset_repository,
                 store_name="raggidy_docs",
             ):
                 payload = dict(event)
@@ -368,8 +399,4 @@ class DocumentService:
                 type(exc).__name__,
                 exc,
             )
-            self.repository.mark_failed(job_id=job_id, text=str(exc))
-        finally:
-            path = Path(file_path)
-            if path.exists():
-                path.unlink()
+            raise

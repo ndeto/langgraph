@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Engine,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -18,6 +19,7 @@ from sqlalchemy import (
     and_,
     create_engine,
     delete,
+    func,
     insert,
     select,
     update,
@@ -45,6 +47,12 @@ from atlasai.application.threads import (
 from atlasai.application.usage import InMemoryUsageRepository, UsageRecord
 from atlasai.config.sys_config import get_env
 from atlasai.domain.models import AnonymousSession
+from atlasai.rag.image_payloads import (
+    MAX_ASSETS_PER_DOCUMENT,
+    MAX_ASSET_SIZE_BYTES,
+    MAX_DOCUMENT_ASSET_BYTES,
+    StoredImageAsset,
+)
 
 metadata = MetaData()
 
@@ -78,6 +86,8 @@ ingestion_jobs_table = Table(
     Column("document_id", String, nullable=False, index=True),
     Column("state", String, nullable=False),
     Column("source_path", String, nullable=True),
+    Column("client_key", String, nullable=True),
+    Column("ip_hash", String, nullable=True),
     Column("attempts", Integer, nullable=False, default=0),
     Column("heartbeat_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -173,6 +183,40 @@ usage_records_table = Table(
     UniqueConstraint("user_id", "run_id", name="uq_usage_user_run"),
 )
 
+assets_table = Table(
+    "assets",
+    metadata,
+    Column("asset_id", String, primary_key=True),
+    Column("user_id", String, nullable=False, index=True),
+    Column("document_id", String, nullable=False, index=True),
+    Column("mime_type", String, nullable=False),
+    Column("payload", LargeBinary, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
+    Column("checksum", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    UniqueConstraint(
+        "document_id",
+        "checksum",
+        name="uq_assets_document_checksum",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class AssetRecord:
+    """Owned binary asset returned by the repository."""
+
+    asset_id: str
+    user_id: str
+    document_id: str
+    mime_type: str
+    payload: bytes
+    size_bytes: int
+    checksum: str
+    created_at: datetime
+    expires_at: datetime
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
@@ -238,6 +282,156 @@ def _to_cleanup_job_record(row: Any) -> CleanupJobRecord:
         heartbeat_at=row.heartbeat_at,
         failure_text=row.failure_text,
     )
+
+
+def _to_asset_record(row: Any) -> AssetRecord:
+    return AssetRecord(
+        asset_id=row.asset_id,
+        user_id=row.user_id,
+        document_id=row.document_id,
+        mime_type=row.mime_type,
+        payload=bytes(row.payload),
+        size_bytes=row.size_bytes,
+        checksum=row.checksum,
+        created_at=row.created_at,
+        expires_at=row.expires_at,
+    )
+
+
+class PostgresAssetRepository:
+    """Stores owner-scoped extracted images in Postgres."""
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+
+    def store_asset(
+        self,
+        *,
+        user_id: str,
+        document_id: str,
+        mime_type: str,
+        payload: bytes,
+        checksum: str,
+    ) -> StoredImageAsset:
+        size_bytes = len(payload)
+        if size_bytes > MAX_ASSET_SIZE_BYTES:
+            raise ValueError("Extracted image exceeds the 5 MB asset limit.")
+        if not mime_type.startswith("image/"):
+            raise ValueError("Extracted asset must use an image MIME type.")
+
+        with self.engine.begin() as conn:
+            document = (
+                conn.execute(
+                    select(documents_table)
+                    .where(
+                        and_(
+                            documents_table.c.document_id == document_id,
+                            documents_table.c.user_id == user_id,
+                        )
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .first()
+            )
+            if document is None:
+                raise ValueError("Owning document does not exist.")
+
+            existing = (
+                conn.execute(
+                    select(assets_table).where(
+                        and_(
+                            assets_table.c.document_id == document_id,
+                            assets_table.c.checksum == checksum,
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if existing is not None:
+                return StoredImageAsset(
+                    asset_id=existing["asset_id"],
+                    mime_type=existing["mime_type"],
+                    size_bytes=existing["size_bytes"],
+                    checksum=existing["checksum"],
+                )
+
+            count, total_bytes = conn.execute(
+                select(
+                    func.count(assets_table.c.asset_id),
+                    func.coalesce(func.sum(assets_table.c.size_bytes), 0),
+                ).where(assets_table.c.document_id == document_id)
+            ).one()
+            if count >= MAX_ASSETS_PER_DOCUMENT:
+                raise ValueError("Document exceeds the 20 image asset limit.")
+            if total_bytes + size_bytes > MAX_DOCUMENT_ASSET_BYTES:
+                raise ValueError("Document exceeds the 25 MB image asset limit.")
+
+            asset = StoredImageAsset(
+                asset_id=str(uuid4()),
+                mime_type=mime_type,
+                size_bytes=size_bytes,
+                checksum=checksum,
+            )
+            conn.execute(
+                insert(assets_table).values(
+                    asset_id=asset.asset_id,
+                    user_id=user_id,
+                    document_id=document_id,
+                    mime_type=mime_type,
+                    payload=payload,
+                    size_bytes=size_bytes,
+                    checksum=checksum,
+                    created_at=_utcnow(),
+                    expires_at=document["expires_at"],
+                )
+            )
+        return asset
+
+    def get_owned_asset(self, *, asset_id: str, user_id: str) -> AssetRecord | None:
+        with self.engine.begin() as conn:
+            row = (
+                conn.execute(
+                    select(assets_table).where(
+                        and_(
+                            assets_table.c.asset_id == asset_id,
+                            assets_table.c.user_id == user_id,
+                            assets_table.c.expires_at > _utcnow(),
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return _to_asset_record(row) if row is not None else None
+
+    def delete_user_assets(self, *, user_id: str) -> int:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                delete(assets_table).where(assets_table.c.user_id == user_id)
+            )
+        return result.rowcount
+
+    def delete_document_assets(self, *, document_id: str, user_id: str) -> int:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                delete(assets_table).where(
+                    and_(
+                        assets_table.c.document_id == document_id,
+                        assets_table.c.user_id == user_id,
+                    )
+                )
+            )
+        return result.rowcount
+
+    def delete_expired_assets(self, *, before: datetime | None = None) -> int:
+        cutoff = before or _utcnow()
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                delete(assets_table).where(assets_table.c.expires_at <= cutoff)
+            )
+        return result.rowcount
 
 
 class PostgresSessionRepository:
@@ -321,6 +515,39 @@ class PostgresSessionRepository:
                 )
             )
         return job
+
+    def enqueue_expired_session_cleanup_jobs(self) -> int:
+        """Queue one cleanup job for each expired session without active cleanup."""
+
+        now = _utcnow()
+        active_cleanup_users = select(cleanup_jobs_table.c.user_id).where(
+            cleanup_jobs_table.c.state.in_(("queued", "processing"))
+        )
+        with self.engine.begin() as conn:
+            user_ids = list(
+                conn.execute(
+                    select(sessions_table.c.user_id).where(
+                        and_(
+                            sessions_table.c.expires_at <= now,
+                            sessions_table.c.user_id.not_in(active_cleanup_users),
+                        )
+                    )
+                ).scalars()
+            )
+            for user_id in user_ids:
+                conn.execute(
+                    insert(cleanup_jobs_table).values(
+                        job_id=str(uuid4()),
+                        user_id=user_id,
+                        state="queued",
+                        attempts=0,
+                        heartbeat_at=None,
+                        created_at=now,
+                        updated_at=now,
+                        failure_text=None,
+                    )
+                )
+        return len(user_ids)
 
     def claim_next_cleanup_job(
         self,
@@ -685,6 +912,25 @@ class PostgresQuotaRepository:
                     active_ingestions=user_row["active_ingestions"] + 1,
                 )
             )
+        return AdmissionResult(True, None, None)
+
+    def complete_upload(
+        self,
+        *,
+        client_key: str,
+        ip_hash: str,
+    ) -> None:
+        with self.engine.begin() as conn:
+            client_key_row = self._get_or_create_client_key_quota(
+                conn,
+                client_key=client_key,
+                lock=True,
+            )
+            ip_row = self._get_or_create_request_key_quota(
+                conn,
+                request_key=ip_hash,
+                lock=True,
+            )
             conn.execute(
                 update(client_key_quotas_table)
                 .where(client_key_quotas_table.c.client_key == client_key)
@@ -695,7 +941,6 @@ class PostgresQuotaRepository:
                 .where(request_key_quotas_table.c.request_key == ip_hash)
                 .values(uploads_used=ip_row["uploads_used"] + 1)
             )
-        return AdmissionResult(True, None, None)
 
     def release_agent_run(self, *, user_id: str) -> None:
         with self.engine.begin() as conn:
@@ -789,6 +1034,8 @@ class PostgresDocumentRepository:
         size_bytes: int,
         ttl_seconds: int,
         source_path: str,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
     ) -> tuple[DocumentRecord, IngestionJobRecord]:
         created_at = _utcnow()
         expires_at = created_at + timedelta(seconds=ttl_seconds)
@@ -810,6 +1057,8 @@ class PostgresDocumentRepository:
             expires_at=expires_at,
             source_path=source_path,
             updated_at=created_at,
+            client_key=client_key,
+            ip_hash=ip_hash,
         )
         with self.engine.begin() as conn:
             conn.execute(
@@ -831,6 +1080,8 @@ class PostgresDocumentRepository:
                     document_id=job.document_id,
                     state=job.state,
                     source_path=job.source_path,
+                    client_key=job.client_key,
+                    ip_hash=job.ip_hash,
                     attempts=job.attempts,
                     heartbeat_at=job.heartbeat_at,
                     created_at=job.created_at,
@@ -891,6 +1142,8 @@ class PostgresDocumentRepository:
             created_at=job_row["created_at"],
             expires_at=job_row["expires_at"],
             source_path=job_row["source_path"],
+            client_key=job_row["client_key"],
+            ip_hash=job_row["ip_hash"],
             attempts=job_row["attempts"],
             heartbeat_at=job_row["heartbeat_at"],
             updated_at=job_row["updated_at"],
@@ -1071,6 +1324,24 @@ class PostgresDocumentRepository:
                 conn, job_id=job_id, payload={"type": "failed", "text": text}
             )
 
+    def mark_retry(self, *, job_id: str, text: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(ingestion_jobs_table)
+                .where(ingestion_jobs_table.c.job_id == job_id)
+                .values(
+                    state="queued",
+                    heartbeat_at=None,
+                    updated_at=_utcnow(),
+                    failure_text=text,
+                )
+            )
+            self._append_event(
+                conn,
+                job_id=job_id,
+                payload={"type": "processing", "text": "Retrying ingestion."},
+            )
+
     @staticmethod
     def _append_event(conn, *, job_id: str, payload: dict) -> None:
         next_event_id = (
@@ -1175,6 +1446,7 @@ class PostgresRepositoryBundle:
         self.quotas: PostgresQuotaRepository | None = None
         self.threads: PostgresThreadRepository | None = None
         self.usage: PostgresUsageRepository | None = None
+        self.assets: PostgresAssetRepository | None = None
 
     async def startup(self) -> None:
         if self.engine is not None:
@@ -1185,6 +1457,7 @@ class PostgresRepositoryBundle:
         self.quotas = PostgresQuotaRepository(self.engine)
         self.threads = PostgresThreadRepository(self.engine)
         self.usage = PostgresUsageRepository(self.engine)
+        self.assets = PostgresAssetRepository(self.engine)
 
     async def shutdown(self) -> None:
         if self.engine is not None:
@@ -1215,6 +1488,11 @@ class PostgresRepositoryBundle:
             conn.execute(
                 update(threads_table)
                 .where(threads_table.c.user_id == user_id)
+                .values(expires_at=now)
+            )
+            conn.execute(
+                update(assets_table)
+                .where(assets_table.c.user_id == user_id)
                 .values(expires_at=now)
             )
             conn.execute(
@@ -1257,6 +1535,7 @@ class PostgresRepositoryBundle:
                         thread_messages_table.c.thread_id.in_(thread_ids)
                     )
                 )
+            conn.execute(delete(assets_table).where(assets_table.c.user_id == user_id))
             conn.execute(delete(documents_table).where(documents_table.c.user_id == user_id))
             conn.execute(delete(threads_table).where(threads_table.c.user_id == user_id))
             conn.execute(
@@ -1269,6 +1548,11 @@ class PostgresRepositoryBundle:
         if self.sessions is None:
             raise RuntimeError("Repository bundle startup must run before use.")
         return self.sessions.enqueue_cleanup_job(user_id=user_id)
+
+    def enqueue_expired_session_cleanup_jobs(self) -> int:
+        if self.sessions is None:
+            raise RuntimeError("Repository bundle startup must run before use.")
+        return self.sessions.enqueue_expired_session_cleanup_jobs()
 
     def claim_next_cleanup_job(
         self,
