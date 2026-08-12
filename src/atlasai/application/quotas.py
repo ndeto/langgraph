@@ -87,6 +87,13 @@ class QuotaRepository(Protocol):
         concurrency_limit: int,
     ) -> AdmissionResult: ...
 
+    def complete_upload(
+        self,
+        *,
+        client_key: str,
+        ip_hash: str,
+    ) -> None: ...
+
     def release_agent_run(self, *, user_id: str) -> None: ...
 
     def release_ingestion(self, *, user_id: str) -> None: ...
@@ -236,6 +243,20 @@ class InMemoryQuotaRepository:
                 active_ingestions=user_snapshot.active_ingestions + 1,
                 active_agent_runs=user_snapshot.active_agent_runs,
             )
+            return AdmissionResult(allowed=True)
+
+    def complete_upload(
+        self,
+        *,
+        client_key: str,
+        ip_hash: str,
+    ) -> None:
+        with self._lock:
+            client_snapshot = self._client_snapshots.get(
+                client_key,
+                BucketQuotaSnapshot(),
+            )
+            ip_snapshot = self._ip_snapshots.get(ip_hash, BucketQuotaSnapshot())
             self._client_snapshots[client_key] = BucketQuotaSnapshot(
                 questions_used=client_snapshot.questions_used,
                 uploads_used=client_snapshot.uploads_used + 1,
@@ -244,7 +265,6 @@ class InMemoryQuotaRepository:
                 questions_used=ip_snapshot.questions_used,
                 uploads_used=ip_snapshot.uploads_used + 1,
             )
-            return AdmissionResult(allowed=True)
 
     def release_agent_run(self, *, user_id: str) -> None:
         with self._lock:
@@ -329,6 +349,22 @@ class QuotaService:
 
     def release_ingestion(self, *, user_id: str) -> None:
         self.repository.release_ingestion(user_id=user_id)
+
+    def complete_upload(
+        self,
+        *,
+        client_key: str | None = None,
+        ip_hash: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        resolved_user_id = user_id or "unknown-user"
+        self.repository.complete_upload(
+            client_key=self._resolve_client_key(
+                user_id=resolved_user_id,
+                client_key=client_key,
+            ),
+            ip_hash=self._resolve_ip_hash(ip_hash=ip_hash),
+        )
 
     def get_session_quota_summary(
         self,

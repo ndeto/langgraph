@@ -3,7 +3,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 
 from atlasai.application.quotas import QuotaPolicy, QuotaService
 from atlasai.application.documents import DocumentService
@@ -16,6 +16,7 @@ from atlasai.application.threads import ThreadService
 from atlasai.application.usage import UsageService
 from atlasai.infrastructure.postgres_repositories import (
     InMemoryRepositoryBundle,
+    PostgresAssetRepository,
     PostgresRepositoryBundle,
 )
 from atlasai.infrastructure.telemetry import TelemetryContext, ensure_trace_id
@@ -111,6 +112,14 @@ def get_vector_service(request: Request) -> PostgresVectorService:
     return request.app.state.vector_service
 
 
+def get_asset_repository(request: Request) -> PostgresAssetRepository:
+    repositories = request.app.state.repositories
+    assets = getattr(repositories, "assets", None)
+    if not isinstance(assets, PostgresAssetRepository):
+        raise HTTPException(status_code=503, detail="Asset storage is unavailable.")
+    return assets
+
+
 def get_session_service(
     settings: Annotated[DemoWebSettings, Depends(get_demo_web_settings)],
     repositories: Annotated[
@@ -161,6 +170,7 @@ def get_quota_service(
     client_key: Annotated[str, Depends(get_client_key)],
     request_key: Annotated[str, Depends(get_request_key)],
 ) -> QuotaService:
+    assert repositories.quotas is not None
     return QuotaService(
         policy=policy,
         repository=repositories.quotas,
@@ -174,6 +184,7 @@ def get_usage_service(
         PostgresRepositoryBundle | InMemoryRepositoryBundle, Depends(get_repositories)
     ],
 ) -> UsageService:
+    assert repositories.usage is not None
     return UsageService(repository=repositories.usage)
 
 
@@ -182,6 +193,7 @@ def get_thread_service(
         PostgresRepositoryBundle | InMemoryRepositoryBundle, Depends(get_repositories)
     ],
 ) -> ThreadService:
+    assert repositories.threads is not None
     return ThreadService(repository=repositories.threads)
 
 
@@ -190,6 +202,7 @@ def get_document_service(
         PostgresRepositoryBundle | InMemoryRepositoryBundle, Depends(get_repositories)
     ],
 ) -> DocumentService:
+    assert repositories.documents is not None
     return DocumentService(repository=repositories.documents)
 
 

@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -31,9 +32,11 @@ from atlasai.web.streaming import (
     encode_ndjson_event,
     extract_usage_payload,
     format_structured_ndjson_chunk,
+    stream_with_keepalive,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["threads"])
+logger = logging.getLogger(__name__)
 
 
 def _build_thread_response(thread) -> ThreadResponse:
@@ -170,6 +173,12 @@ async def post_thread_message(
                 if isinstance(chunk, dict) and chunk.get("type") == "sources":
                     assets = chunk.get("data")
                     if isinstance(assets, list):
+                        logger.info(
+                            "thread_stream_sources thread_id=%s trace_id=%s assets=%s",
+                            thread.thread_id,
+                            request_context.trace_id,
+                            assets,
+                        )
                         for asset in assets:
                             if isinstance(asset, dict):
                                 assistant_assets.append(asset)
@@ -190,6 +199,12 @@ async def post_thread_message(
                         record=record,
                     )
                     if assistant_text_parts or assistant_assets:
+                        logger.info(
+                            "thread_persist_assistant_assets thread_id=%s trace_id=%s assets=%s",
+                            thread.thread_id,
+                            request_context.trace_id,
+                            assistant_assets,
+                        )
                         thread_service.append_owned_message(
                             user_id=request_context.session.session.user_id,
                             thread_id=thread.thread_id,
@@ -232,6 +247,12 @@ async def post_thread_message(
                     record=record,
                 )
                 if assistant_text_parts or assistant_assets:
+                    logger.info(
+                        "thread_persist_assistant_assets thread_id=%s trace_id=%s assets=%s",
+                        thread.thread_id,
+                        request_context.trace_id,
+                        assistant_assets,
+                    )
                     thread_service.append_owned_message(
                         user_id=request_context.session.session.user_id,
                         thread_id=thread.thread_id,
@@ -274,7 +295,7 @@ async def post_thread_message(
             )
 
     response = StreamingResponse(
-        response_stream(),
+        stream_with_keepalive(response_stream()),
         media_type="application/x-ndjson",
         headers={
             "Cache-Control": "no-cache",

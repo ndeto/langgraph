@@ -25,9 +25,8 @@ def build_request_key_hash(request: Request, settings: DemoWebSettings) -> str:
 
 
 def _resolve_client_ip(*, request: Request, trusted_proxies: Iterable[str]) -> str:
-    trusted = {proxy.strip() for proxy in trusted_proxies if proxy.strip()}
     immediate_client = request.client.host if request.client else ""
-    if immediate_client in trusted:
+    if _is_trusted_proxy(immediate_client, trusted_proxies):
         forwarded_for = request.headers.get("x-forwarded-for")
         if forwarded_for:
             first_hop = forwarded_for.split(",")[0].strip()
@@ -39,6 +38,25 @@ def _resolve_client_ip(*, request: Request, trusted_proxies: Iterable[str]) -> s
             return real_ip.strip()
 
     return immediate_client or "0.0.0.0"
+
+
+def _is_trusted_proxy(client_ip: str, trusted_proxies: Iterable[str]) -> bool:
+    try:
+        parsed_client = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+
+    for proxy in trusted_proxies:
+        value = proxy.strip()
+        if not value:
+            continue
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            continue
+        if parsed_client in network:
+            return True
+    return False
 
 
 def _normalize_ip(value: str) -> str:

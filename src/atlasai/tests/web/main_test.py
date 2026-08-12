@@ -1,9 +1,10 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import unittest
 from collections.abc import AsyncIterator
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
@@ -21,7 +22,6 @@ from atlasai.infrastructure.worker import (
     process_next_cleanup_job,
     process_next_ingestion_job,
 )
-from atlasai.rag.image_payloads import IMAGE_OUTPUT_DIR
 from atlasai.service.contracts import GraphRunner
 from atlasai.web.main import create_app
 from atlasai.web.streaming import extract_usage_payload
@@ -238,8 +238,7 @@ class TestWeb(TestCase):
             build_in_memory_repository_bundle(),
         )
         test_client = TestClient(app)
-        first_response = test_client.get("/api/v1/session")
-        user_id = first_response.json()["user_id"]
+        test_client.get("/api/v1/session")
 
         app.state.repositories.quotas.set_client_snapshot(
             client_key="anonymous-browser",
@@ -261,15 +260,14 @@ class TestWeb(TestCase):
         )
         self.assertIn("x-trace-id", res.headers)
 
-    def test_ingest_pdf_rejects_when_upload_quota_is_exhausted(self):
+    def test_documents_reject_when_upload_quota_is_exhausted(self):
         app = create_app(
             FakeGraphService(),
             FakeVectorService(),
             build_in_memory_repository_bundle(),
         )
         test_client = TestClient(app)
-        first_response = test_client.get("/api/v1/session")
-        user_id = first_response.json()["user_id"]
+        test_client.get("/api/v1/session")
 
         app.state.repositories.quotas.set_client_snapshot(
             client_key="anonymous-browser",
@@ -277,7 +275,7 @@ class TestWeb(TestCase):
         )
 
         res = test_client.post(
-            "/ingest/pdf",
+            "/api/v1/documents",
             files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
         )
 
@@ -326,7 +324,7 @@ class TestWeb(TestCase):
             },
         )
 
-    def test_ingest_pdf_rejects_when_request_key_upload_quota_is_exhausted(self):
+    def test_documents_reject_when_network_upload_quota_is_exhausted(self):
         with patch.dict(os.environ, {"ATLAS_DEMO_IP_UPLOAD_LIMIT": "1"}):
             app = create_app(
                 FakeGraphService(),
@@ -337,28 +335,30 @@ class TestWeb(TestCase):
         first_client = TestClient(app)
         second_client = TestClient(app)
 
-        async def fake_stream_ingest_pdf(*_, **__):
-            yield {"type": "done", "text": "Ingestion complete"}
+        first_client.get("/api/v1/session")
+        first = first_client.post(
+            "/api/v1/documents",
+            headers={"x-atlas-client-key": "browser-1"},
+            files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
+        )
+        ip_hash = hmac.new(
+            b"atlas-demo-ip-dev-secret",
+            b"testclient",
+            hashlib.sha256,
+        ).hexdigest()
+        app.state.repositories.quotas.set_ip_snapshot(
+            ip_hash=ip_hash,
+            snapshot=BucketQuotaSnapshot(uploads_used=1),
+        )
 
-        with patch(
-            "atlasai.web.main.get_stream_ingest_pdf",
-            return_value=fake_stream_ingest_pdf,
-        ):
-            first_client.get("/api/v1/session")
-            first = first_client.post(
-                "/ingest/pdf",
-                headers={"x-atlas-client-key": "browser-1"},
-                files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
-            )
+        second_client.get("/api/v1/session")
+        second = second_client.post(
+            "/api/v1/documents",
+            headers={"x-atlas-client-key": "browser-2"},
+            files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
+        )
 
-            second_client.get("/api/v1/session")
-            second = second_client.post(
-                "/ingest/pdf",
-                headers={"x-atlas-client-key": "browser-2"},
-                files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
-            )
-
-        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(
             second.json(),
@@ -647,7 +647,7 @@ class TestWeb(TestCase):
             ["user", "assistant"],
         )
         self.assertEqual(restored.json()["messages"][0]["content"], "Hello")
-        self.assertEqual(restored.json()["messages"][1]["content"], "token ")
+        self.assertEqual(restored.json()["messages"][1]["content"], "token")
 
     def test_get_thread_does_not_persist_inline_rag_image_data(self):
         app = create_app(
@@ -923,11 +923,6 @@ class TestWeb(TestCase):
         first = test_client.get("/api/v1/session")
         original_user_id = first.json()["user_id"]
         original_cookie = first.cookies.get("atlas_demo_session")
-        image_dir = IMAGE_OUTPUT_DIR / original_user_id
-        image_dir.mkdir(parents=True, exist_ok=True)
-        image_file = image_dir / "sample.png"
-        image_file.write_bytes(b"fake-image")
-
         test_client.post(
             "/api/v1/session/rotate",
             cookies={"atlas_demo_session": original_cookie},
@@ -951,9 +946,8 @@ class TestWeb(TestCase):
             getattr(app.state.vector_service, "deleted", []),
             [("raggidy_docs", original_user_id)],
         )
-        self.assertFalse(image_file.exists())
 
-    def test_ingest_pdf_records_unknown_usage_without_affecting_token_totals(self):
+    def test_worker_records_unknown_ingestion_usage_without_token_totals(self):
         app = create_app(
             FakeGraphService(),
             FakeVectorService(),
@@ -967,15 +961,23 @@ class TestWeb(TestCase):
         async def fake_stream_ingest_pdf(*_, **__):
             yield {"type": "done", "text": "Ingestion complete"}
 
-        with patch(
-            "atlasai.web.main.get_stream_ingest_pdf",
-            return_value=fake_stream_ingest_pdf,
-        ):
+        with patch("atlasai.rag.rag_ingestion.stream_ingest_pdf", new=fake_stream_ingest_pdf):
             res = test_client.post(
-                "/ingest/pdf",
-                headers={"x-trace-id": "trace-ingest"},
+                "/api/v1/documents",
                 cookies={"atlas_demo_session": cookie_value},
                 files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
+            )
+            asyncio.run(
+                process_next_ingestion_job(
+                    app.state.repositories,
+                    app.state.vector_service,
+                    settings=WorkerSettings(
+                        poll_seconds=0.01,
+                        cleanup_poll_seconds=0.01,
+                        heartbeat_timeout_seconds=60,
+                        max_attempts=3,
+                    ),
+                )
             )
 
         records = app.state.repositories.usage.list_records(user_id=user_id)
@@ -984,7 +986,7 @@ class TestWeb(TestCase):
             cookies={"atlas_demo_session": cookie_value},
         )
 
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 202)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].operation, "ingestion")
         self.assertEqual(records[0].status, "unknown")
@@ -993,59 +995,14 @@ class TestWeb(TestCase):
             {"input": 0, "output": 0, "total": 0},
         )
 
-    def test_ingest_pdf_rejects_non_pdf_uploads(self):
+    def test_documents_reject_non_pdf_uploads(self):
         res = client.post(
-            "/ingest/pdf",
+            "/api/v1/documents",
             files={"file": ("notes.txt", b"hello", "text/plain")},
         )
 
         self.assertEqual(res.status_code, 400)
         self.assertEqual(res.json(), {"detail": "Only PDF uploads are supported."})
-
-    def test_ingest_pdf_streams_ingestion_events(self):
-        async def fake_stream_ingest_pdf(*_, **__):
-            yield {"type": "file", "file_name": "sample.pdf"}
-            yield {"type": "log", "text": "Preparing ingestion for sample.pdf"}
-            yield {"type": "stats", "elements": 8, "chunks": 3, "docs": 2}
-            yield {
-                "type": "done",
-                "text": "Ingestion complete",
-                "file_name": "sample.pdf",
-                "elements": 8,
-                "chunks": 3,
-                "docs": 2,
-            }
-
-        with patch(
-            "atlasai.web.main.get_stream_ingest_pdf",
-            return_value=fake_stream_ingest_pdf,
-        ):
-            res = client.post(
-                "/ingest/pdf?stream_format=ndjson",
-                files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")},
-            )
-
-        events = [json.loads(line) for line in res.text.splitlines()]
-
-        self.assertEqual(res.status_code, 200)
-        self.assertIn("application/x-ndjson", res.headers["content-type"])
-        self.assertEqual(
-            events,
-            [
-                {"type": "file", "file_name": "sample.pdf"},
-                {"type": "log", "text": "Preparing ingestion for sample.pdf"},
-                {"type": "stats", "elements": 8, "chunks": 3, "docs": 2},
-                {
-                    "type": "done",
-                    "text": "Ingestion complete",
-                    "file_name": "sample.pdf",
-                    "elements": 8,
-                    "chunks": 3,
-                    "docs": 2,
-                },
-            ],
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

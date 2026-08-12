@@ -233,6 +233,10 @@ class TestQuotaService(unittest.TestCase):
                 message="Another document is still processing.",
             ),
         )
+        self.assertEqual(
+            repository.get_client_snapshot(client_key="browser-1"),
+            BucketQuotaSnapshot(questions_used=0, uploads_used=0),
+        )
 
     def test_claim_question_enforces_request_key_limit_across_users(self):
         repository = InMemoryQuotaRepository()
@@ -292,13 +296,13 @@ class TestQuotaService(unittest.TestCase):
             client_key="browser-1",
             ip_hash="hash-1",
         )
+        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
+        service.complete_upload(client_key="browser-1", ip_hash="hash-1")
         second = service.claim_upload(
             user_id="user-2",
             client_key="browser-2",
             ip_hash="hash-1",
         )
-
-        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
         self.assertEqual(
             second,
             AdmissionResult(
@@ -309,6 +313,39 @@ class TestQuotaService(unittest.TestCase):
         )
         self.assertEqual(
             repository.get_ip_snapshot(ip_hash="hash-1"),
+            BucketQuotaSnapshot(questions_used=0, uploads_used=1),
+        )
+
+    def test_complete_upload_increments_browser_bucket_only_after_success(self):
+        repository = InMemoryQuotaRepository()
+        service = QuotaService(
+            policy=QuotaPolicy(
+                user_question_limit=10,
+                user_upload_limit=2,
+                ip_question_limit=30,
+                ip_upload_limit=4,
+                concurrent_ingestions_per_user=1,
+                concurrent_agent_runs_per_user=1,
+            ),
+            repository=repository,
+        )
+
+        first = service.claim_upload(
+            user_id="user-1",
+            client_key="browser-1",
+            ip_hash="hash-1",
+        )
+
+        self.assertEqual(first, AdmissionResult(allowed=True, code=None, message=None))
+        self.assertEqual(
+            repository.get_client_snapshot(client_key="browser-1"),
+            BucketQuotaSnapshot(questions_used=0, uploads_used=0),
+        )
+
+        service.complete_upload(client_key="browser-1", ip_hash="hash-1")
+
+        self.assertEqual(
+            repository.get_client_snapshot(client_key="browser-1"),
             BucketQuotaSnapshot(questions_used=0, uploads_used=1),
         )
 
