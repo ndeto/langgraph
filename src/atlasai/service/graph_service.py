@@ -1,21 +1,16 @@
 import asyncio
-import json
 import logging
-import os
 import tracemalloc
 from collections.abc import AsyncIterator
-from contextlib import nullcontext
 from typing import cast
 
 import requests
 from langchain.messages import HumanMessage, RemoveMessage, SystemMessage, trim_messages
 from langchain.tools import BaseTool, tool
-from langchain_classic.prompts import PromptTemplate
 from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.runtime import Runtime
 from langgraph.store.postgres.aio import AsyncPostgresStore
@@ -31,13 +26,8 @@ from typing_extensions import TypedDict
 
 from atlasai.config.models import search_model, system_model
 from atlasai.config.sys_config import SysConfig
-from atlasai.infrastructure.telemetry import (
-    TelemetryContext,
-    build_langfuse_callback,
-    build_telemetry_metadata,
-    langfuse_attributes,
-)
-from atlasai.lib.session import Context, MemoryUpdateResult, StateContext
+from atlasai.internal.graphs.template import print_graph
+from atlasai.lib.session import Context, StateContext
 from atlasai.rag.utils import (
     build_document_context_prompt,
     build_retrieved_image_assets,
@@ -45,12 +35,53 @@ from atlasai.rag.utils import (
 from atlasai.service.contracts import GraphRunner, InvokePayload
 from atlasai.store import PostgresVectorService, tool_store
 from atlasai.tools import math_tools
-from atlasai.util.utils import load_file
 
 if not tracemalloc.is_tracing():
     tracemalloc.start(25)
 
 logger = logging.getLogger(__name__)
+
+SUMMARY_TRIGGER_MESSAGE_COUNT = 12
+SUMMARY_KEEP_LAST_MESSAGES = 6
+
+
+class PriceInput(BaseModel):
+    ticker: str = Field(description="The ticker for the price we are fetching")
+
+
+class CryptoPriceToolInputSchema(TypedDict):
+    ticker: str
+
+
+class CryptoPriceTool(BaseTool):
+    name: str = "get_crypto_prices"
+    description: str = "Coin gecko API used to retrieve cryptocurrency prices"
+
+    _config: SysConfig = PrivateAttr()
+
+    def __init__(self, config: SysConfig, **kwargs):
+        super().__init__(**kwargs)
+        self._config = config
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        reraise=True,
+    )
+    def _run(self, ticker: str):
+        if not self.validate_schema(ticker):
+            return ValueError("Schema not Valid")
+
+        # Request the current USD price from CoinGecko.
+        coin_gecko_url = f"https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids={ticker}&x_cg_demo_api_key={self._config['cg_api_key']}"
+        res = requests.get(coin_gecko_url)
+        res.raise_for_status()
+
+        return res.json()
+
+    def validate_schema(self, ticker: str) -> bool:
+        return ticker is not None
 
 
 class GraphService(GraphRunner):
@@ -68,14 +99,13 @@ class GraphService(GraphRunner):
     ) -> None:
         self.sys_config = config
         self.vector_service = vector_service
-        self.get_crypto_prices = self.CryptoPriceTool(config)
+        self.get_crypto_prices = CryptoPriceTool(config)
         self.tool_retriever = tool_store(self.tools_list).as_retriever(
             search_kwargs={"k": 5}
         )
         self.checkpointer = None
         self.store = None
         self.graph = None
-        self.memory_graph = None
 
         @tool
         async def search_user_info(query: str):
@@ -114,9 +144,7 @@ class GraphService(GraphRunner):
         self.graph = self.build_main_graph().compile(
             checkpointer=self.checkpointer, store=self.store
         )
-        self.memory_graph = self.build_memory_graph().compile(
-            checkpointer=self.checkpointer, store=self.store
-        )
+        print_graph(self.graph, "graph.png")
 
     async def shutdown(self):
         """Close Postgres resource context managers."""
@@ -125,42 +153,6 @@ class GraphService(GraphRunner):
             await self.pg_store_ctx.__aexit__(None, None, None)
         if self.checkpointer_ctx is not None:
             await self.checkpointer_ctx.__aexit__(None, None, None)
-
-    class PriceInput(BaseModel):
-        ticker: str = Field(description="The ticker for the price we are fetching")
-
-    class CryptoPriceToolInputSchema(TypedDict):
-        ticker: str
-
-    class CryptoPriceTool(BaseTool):
-        name: str = "get_crypto_prices"
-        description: str = "Coin gecko API used to retrieve cryptocurrency prices"
-
-        _config: SysConfig = PrivateAttr()
-
-        def __init__(self, config: SysConfig, **kwargs):
-            super().__init__(**kwargs)
-            self._config = config
-
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=2, min=2, max=10),
-            retry=retry_if_exception_type(requests.exceptions.RequestException),
-            reraise=True,
-        )
-        def _run(self, ticker: str):
-            if not self.validate_schema(ticker):
-                return ValueError("Schema not Valid")
-
-            # Request the current USD price from CoinGecko.
-            coin_gecko_url = f"https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids={ticker}&x_cg_demo_api_key={self._config['cg_api_key']}"
-            res = requests.get(coin_gecko_url)
-            res.raise_for_status()
-
-            return res.json()
-
-        def validate_schema(self, ticker: str) -> bool:
-            return ticker is not None
 
     def retrieve_tools(self, tool_names: list[str]):
         return [
@@ -195,18 +187,12 @@ class GraphService(GraphRunner):
             "soul": self.sys_config["soul"],
         }
 
-        fact_context = []
-        if "recent_facts" in state:
-            for f in state["recent_facts"]:
-                fact_context.append(json.dumps(f))
-
         instruction_prompt = self.sys_config.get("user_instruction_prompt")
         system_instruction = f"Available Tools: {state.get('resolved_tools')}"
         user_input = state.get("user_input") or ""
         user_id = state.get("user_id")
-        thread_id = state.get("thread_id")
-        document_id = state.get("document_id")
         trace_id = state.get("trace_id")
+        summary = state.get("summary")
 
         filter_payload: dict[str, str] | None = None
         if user_id:
@@ -221,16 +207,25 @@ class GraphService(GraphRunner):
             user_input, rag_res, "knowledge-base"
         )
         related_image_assets = build_retrieved_image_assets(rag_res)
+        logger.info(
+            "rag_image_assets trace_id=%s user_id=%s retrieved_chunks=%s assets=%s",
+            trace_id,
+            user_id,
+            len(rag_res),
+            related_image_assets,
+        )
 
         history = state.get("messages") or []
         system_context = "\n\n".join(
-            [
+            part
+            for part in [
                 system_instruction,
                 f"RAG DOCUMENT CONTEXT:\n{rag_context}",
+                f"CONVERSATION SUMMARY:\n{summary}" if summary else None,
                 f"INSTRUCTIONS PROMPT: {instruction_prompt}",
                 f"SOUL FILE: {context['soul']}",
-                f"RECENT FACTS:\n{json.dumps(fact_context)}",
             ]
+            if part
         )
 
         messages = [
@@ -259,40 +254,17 @@ class GraphService(GraphRunner):
         print(llm_status, flush=True)
         runtime.stream_writer({"type": "status", "data": llm_status})
         usage_callback = UsageMetadataCallbackHandler()
-        telemetry_context = TelemetryContext(
-            operation="agent",
-            user_id=user_id,
-            thread_id=thread_id,
-            document_id=document_id,
-            trace_id=trace_id,
-            provider=self.sys_config["model"]["provider"],
-            model=self.sys_config["model"]["model"],
-        )
         callbacks = [usage_callback]
-        langfuse_callback = build_langfuse_callback()
-        if langfuse_callback is not None:
-            callbacks.append(langfuse_callback)
-        metadata = build_telemetry_metadata(telemetry_context)
-        langfuse_ctx = (
-            langfuse_attributes(
-                telemetry_context,
-                trace_name="atlas-main-agent",
-            )
-            if langfuse_callback is not None
-            else nullcontext()
+        response = await llm.bind_tools(tools).ainvoke(
+            trimmed_messages,
+            config=cast(
+                RunnableConfig,
+                {
+                    "callbacks": callbacks,
+                    "run_name": "atlas-main-agent",
+                },
+            ),
         )
-        with langfuse_ctx:
-            response = await llm.bind_tools(tools).ainvoke(
-                trimmed_messages,
-                config=cast(
-                    RunnableConfig,
-                    {
-                        "callbacks": callbacks,
-                        "run_name": "atlas-main-agent",
-                        "metadata": metadata,
-                    },
-                ),
-            )
 
         for tool_call in response.tool_calls:
             tool_status = f"[Atlas AI] Calling tool: {tool_call['name']}"
@@ -337,121 +309,55 @@ class GraphService(GraphRunner):
             "usage_payload": usage_payload,
         }
 
-    def prune_messages_node(self, state: StateContext):
-        messages = state.get("messages") or []
+    @staticmethod
+    def _messages_to_summarize(messages: list[object]) -> list[object]:
+        """Return the older thread messages that should be summarized."""
 
-        if len(messages) <= 10:
+        if len(messages) <= SUMMARY_TRIGGER_MESSAGE_COUNT:
+            return []
+
+        kept_messages = messages[-SUMMARY_KEEP_LAST_MESSAGES:]
+        if not kept_messages:
+            return []
+
+        keep_start_index = len(messages) - len(kept_messages)
+        for index, message in enumerate(kept_messages, start=keep_start_index):
+            if getattr(message, "type", None) in {"human", "system"}:
+                return messages[:index]
+
+        return []
+
+    async def summarize_conversation_node(self, state: StateContext):
+        messages = state.get("messages") or []
+        summarize_messages = self._messages_to_summarize(messages)
+        if not summarize_messages:
             return {}
 
-        kept_messages = messages[-5:]
-
-        return {
-            "messages": [
-                RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                *kept_messages,
-            ]
-        }
-
-    def memory_extractor_node(self, state: StateContext):
-        prompt_temp = PromptTemplate.from_template("""
-                                                    You are maintaining the user's conversational memory.
-
-                                                    User input:
-                                                    {user_input}
-
-                                                    Recent messages:
-                                                    {messages}
-
-                                                    Existing long-term memory:
-                                                    {existing_memory}
-
-                                                    Your tasks:
-                                                    1. Extract short-term facts that are useful for the next immediate reply.
-                                                    2. Infer the user's mood if it is helpful and reasonably clear from the conversation.
-                                                    3. Update the existing long-term memory by merging in only durable facts from the recent interaction.
-
-                                                    Durable long-term memory includes:
-                                                    - who the user is
-                                                    - their interests
-                                                    - recurring goals and projects
-                                                    - stable preferences
-                                                    - behavioral patterns in how they like to work, communicate, or receive answers
-                                                    - repeated constraints, habits, or priorities
-
-                                                    Rules for long-term memory:
-                                                    - Do not store one-off requests or temporary turn-specific details.
-                                                    - Deduplicate overlapping facts.
-                                                    - Merge facts that describe the same thing.
-                                                    - Update stale or conflicting memory with the newer information.
-                                                    - Preserve a clean category and sub_category structure.
-                                                    - Avoid repeated keys, repeated entries, and near-duplicate categories.
-                                                    - If there is no meaningful durable update, return the existing long-term memory unchanged.
-
-                                                    Return:
-                                                    - short_term_facts
-                                                    - updated_long_term_memory
-                                                    - user_mood
-                                                """)
-
+        existing_summary = (state.get("summary") or "").strip()
         llm = search_model(self.sys_config)
-
-        extractor = prompt_temp | llm.with_structured_output(MemoryUpdateResult)
-
-        messages = state.get("messages") or []
-        memory_path = "structured_memory.json"
-
-        if not os.path.exists(memory_path):
-            with open(memory_path, "w", encoding="utf-8") as file:
-                json.dump([], file)
-
-        existing_memory = load_file(memory_path)
-
-        telemetry_context = TelemetryContext(
-            operation="memory",
-            user_id=state.get("user_id"),
-            thread_id=state.get("thread_id"),
-            document_id=state.get("document_id"),
-            trace_id=state.get("trace_id"),
-            provider=self.sys_config["model"]["provider"],
-            model="gpt-4o-mini",
+        summary_prefix = (
+            f"Current summary:\n{existing_summary}\n\n" if existing_summary else ""
         )
-        callbacks = []
-        langfuse_callback = build_langfuse_callback()
-        if langfuse_callback is not None:
-            callbacks.append(langfuse_callback)
-        metadata = build_telemetry_metadata(telemetry_context)
-        langfuse_ctx = (
-            langfuse_attributes(
-                telemetry_context,
-                trace_name="atlas-memory-extractor",
-            )
-            if langfuse_callback is not None
-            else nullcontext()
-        )
-        with langfuse_ctx:
-            res = extractor.invoke(
-                {
-                    "messages": messages[-5:],
-                    "user_input": state.get("user_input"),
-                    "existing_memory": existing_memory,
-                },
-                config={
-                    "callbacks": callbacks,
-                    "run_name": "atlas-memory-extractor",
-                    "metadata": metadata,
-                },
-            )
+        summary_instruction = f"""
+        {summary_prefix},
+        Summarize the older conversation messages above.
+        Keep durable user facts, active work, decisions, preferences, unresolved questions, and important document context.
+        Return only the updated running summary."""
 
-        updated_long_term_memory = (
-            res.get("updated_long_term_memory") or existing_memory
+        response = await llm.ainvoke(
+            [
+                *summarize_messages,
+                HumanMessage(content=summary_instruction),
+            ],
+            config={"run_name": "atlas-thread-summarizer"},
         )
 
-        with open(memory_path, "w", encoding="utf-8") as file:
-            json.dump(updated_long_term_memory, file, indent=2)
+        updated_summary = self._message_chunk_text(response).strip()
+        if not updated_summary:
+            return {}
 
         return {
-            "recent_facts": res.get("short_term_facts"),
-            "user_mood": res.get("user_mood"),
+            "summary": updated_summary,
         }
 
     def build_main_graph(self):
@@ -469,18 +375,6 @@ class GraphService(GraphRunner):
 
         return builder
 
-    def build_memory_graph(self):
-        mem_graph = StateGraph(state_schema=StateContext)
-
-        mem_graph.add_node("memory", self.memory_extractor_node)
-        mem_graph.add_node("prune_messages", self.prune_messages_node)
-
-        mem_graph.add_edge(START, "prune_messages")
-        mem_graph.add_edge("prune_messages", "memory")
-        mem_graph.add_edge("memory", END)
-
-        return mem_graph
-
     def build_graph_config(self, thread_id: str, run_name: str):
         config: RunnableConfig = {
             "configurable": {"thread_id": thread_id},
@@ -489,19 +383,41 @@ class GraphService(GraphRunner):
 
         return config
 
-    async def run_memory_graph(self, thread_id, state):
-        if self.memory_graph is None:
-            raise RuntimeError("Graph service startup must run before memory graph use.")
-        return await self.memory_graph.ainvoke(
-            state,
-            config=self.build_graph_config(thread_id, "atlasai-memory-graph"),
+    async def run_summarizer(self, thread_id: str) -> None:
+        if self.graph is None:
+            raise RuntimeError("Graph service startup must run before summarizer use.")
+
+        config = self.build_graph_config(thread_id, "atlasai-thread-summary")
+        state_snapshot = await self.graph.aget_state(config)
+        state = cast(StateContext, state_snapshot.values)
+        summarize_messages = self._messages_to_summarize(state.get("messages") or [])
+        if not summarize_messages:
+            return
+
+        summary_update = await self.summarize_conversation_node(state)
+        updated_summary = summary_update.get("summary")
+        if not isinstance(updated_summary, str) or not updated_summary.strip():
+            return
+
+        delete_messages = [
+            RemoveMessage(id=message.id)
+            for message in summarize_messages
+            if getattr(message, "id", None)
+        ]
+        await self.graph.aupdate_state(
+            config,
+            {
+                "summary": updated_summary.strip(),
+                "messages": delete_messages,
+            },
+            as_node="agent",
         )
 
     def _log_background_task(self, task: asyncio.Task) -> None:
         try:
             task.result()
         except Exception as exc:
-            print(f"Background memory graph failed: {exc}")
+            print(f"Background summarizer failed: {exc}")
 
     @staticmethod
     def _message_chunk_text(message: object) -> str:
@@ -582,7 +498,7 @@ class GraphService(GraphRunner):
                 if isinstance(selected_image_assets, list) and selected_image_assets:
                     yield {"type": "sources", "data": selected_image_assets}
 
-                final_state: StateContext | dict[str, object] = last_state
+                final_state: StateContext = last_state
                 if latest_usage_payload is not None and not last_state.get(
                     "usage_payload"
                 ):
@@ -590,10 +506,8 @@ class GraphService(GraphRunner):
 
                 yield {"type": "final", "data": final_state}
 
-                memory_task = asyncio.create_task(
-                    self.run_memory_graph(thread_id, last_state)
-                )
-                memory_task.add_done_callback(self._log_background_task)
+                summary_task = asyncio.create_task(self.run_summarizer(thread_id))
+                summary_task.add_done_callback(self._log_background_task)
 
         except Exception as e:
             print(e)

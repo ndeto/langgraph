@@ -36,7 +36,6 @@ class StateContext(TypedDict, total=False):
     trace_id: str
     available_tools_metadata: list | None
     resolved_tools: list[str]
-    recent_facts: list[Facts]
-    user_mood: str | None
+    summary: str | None
     selected_image_assets: list[dict] | None
     usage_payload: dict | None
