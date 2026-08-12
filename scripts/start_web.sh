@@ -7,6 +7,11 @@ FASTAPI_APP="${ATLASAI_FASTAPI_APP:-src/atlasai/web/main.py}"
 FASTAPI_HOST="${ATLASAI_FASTAPI_HOST:-127.0.0.1}"
 FASTAPI_PORT="${ATLASAI_FASTAPI_PORT:-8000}"
 WORKER_CMD="${ATLASAI_WORKER_CMD:-uv run python -m atlasai.infrastructure.worker}"
+RELOAD_DIRS=(
+    "${ATLASAI_RELOAD_DIR_1:-src}"
+    "${ATLASAI_RELOAD_DIR_2:-frontend/src}"
+)
+WORKER_MATCH="${ATLASAI_WORKER_MATCH:-python3 -m atlasai.infrastructure.worker}"
 
 cleanup() {
     local exit_code=$?
@@ -26,13 +31,20 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$ROOT_DIR"
+
+pkill -f "$WORKER_MATCH" 2>/dev/null || true
+
 uv run alembic upgrade head
 
 cd "$ROOT_DIR/frontend"
 npm run build -- --outDir ../src/atlasai/web/static --emptyOutDir
 
 cd "$ROOT_DIR"
-uv run fastapi dev "$FASTAPI_APP" --host "$FASTAPI_HOST" --port "$FASTAPI_PORT" &
+FASTAPI_DEV_CMD=(uv run fastapi dev "$FASTAPI_APP" --host "$FASTAPI_HOST" --port "$FASTAPI_PORT")
+for reload_dir in "${RELOAD_DIRS[@]}"; do
+    FASTAPI_DEV_CMD+=(--reload-dir "$reload_dir")
+done
+"${FASTAPI_DEV_CMD[@]}" &
 FASTAPI_PID=$!
 
 eval "$WORKER_CMD" &
