@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
-import mimetypes
+import os
+import platform
 import re
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -16,7 +18,12 @@ from unstructured.chunking.title import chunk_by_title
 from unstructured.partition.pdf import partition_pdf
 
 from atlasai.config.sys_config import SysConfig, bootstrap_config
-from atlasai.rag.image_payloads import image_file_to_data_url, persist_base64_image
+from atlasai.rag.image_payloads import (
+    ImageAssetRepository,
+    StoredImageAsset,
+    build_data_url,
+    decode_base64_image,
+)
 from atlasai.store.hybrid_store import PostgresVectorService
 
 config: SysConfig = bootstrap_config()
@@ -78,12 +85,22 @@ def partition_pdf_doc(
 ):
     """Partitions the document"""
     resolved_path = Path(path)
+    sample_bytes: bytes | None = None
+    read_error: str | None = None
+    try:
+        with resolved_path.open("rb") as pdf_file:
+            sample_bytes = pdf_file.read(32)
+    except Exception as exc:
+        read_error = f"{type(exc).__name__}: {exc}"
     emit_log(
         logger,
         (
             "Partitioning document "
             f"(path={resolved_path}, exists={resolved_path.exists()}, "
             f"size_bytes={resolved_path.stat().st_size if resolved_path.exists() else 'missing'}, "
+            f"cwd={Path.cwd()}, platform={platform.platform()}, "
+            f"pid={os.getpid()}, readable={read_error is None}, "
+            f"read_error={read_error}, sample_header={sample_bytes!r}, "
             "strategy=hi_res, extract_images=True)"
         ),
     )
@@ -131,9 +148,9 @@ class ContentData(TypedDict):
 
 
 class ImageEntry(TypedDict, total=False):
-    image_id: str
-    path: str
+    asset_id: str
     mime_type: str
+    checksum: str
     context_text: str
     summary: str
 
@@ -192,15 +209,14 @@ def is_generic_image_summary(summary: str) -> bool:
 
 
 def summarize_image_for_retrieval(
-    image_path: str,
+    image_payload: bytes,
     *,
+    mime_type: str,
     context_text: str,
 ) -> str:
     """Create a retrieval-oriented summary for one extracted image."""
 
-    data_url = image_file_to_data_url(image_path)
-    if not data_url:
-        return build_contextual_image_summary(context_text)
+    data_url = build_data_url(mime_type, image_payload)
 
     llm = ChatOpenAI()
     context_excerpt = normalize_image_context(context_text, max_chars=1200)
@@ -244,20 +260,17 @@ def summarize_image_for_retrieval(
 
 
 def build_image_entry(
-    image_path: str,
+    asset: StoredImageAsset,
+    image_payload: bytes,
     *,
     context_text: str,
-    image_index: int,
 ) -> ImageEntry:
     """Build stored metadata for one extracted image."""
 
-    mime_type, _ = mimetypes.guess_type(image_path)
-    if not mime_type:
-        mime_type = "image/png"
-
     try:
         summary = summarize_image_for_retrieval(
-            image_path,
+            image_payload,
+            mime_type=asset.mime_type,
             context_text=context_text,
         )
     except Exception:
@@ -267,9 +280,9 @@ def build_image_entry(
         summary = build_contextual_image_summary(context_text)
 
     return {
-        "image_id": f"img_{image_index}",
-        "path": image_path,
-        "mime_type": mime_type,
+        "asset_id": asset.asset_id,
+        "mime_type": asset.mime_type,
+        "checksum": asset.checksum,
         "context_text": context_text.strip()[:800],
         "summary": summary,
     }
@@ -280,6 +293,7 @@ def separate_content_types(
     *,
     user_id: str | None = None,
     document_id: str | None = None,
+    asset_repository: ImageAssetRepository | None = None,
 ) -> ContentData:
     """Analyze what kind of content is in a chunk"""
     chunk_text = extract_chunk_text(chunk)
@@ -291,7 +305,6 @@ def separate_content_types(
     }
 
     if hasattr(chunk, "metadata") and hasattr(chunk.metadata, "orig_elements"):
-        image_index = 1
         for element in chunk.metadata.orig_elements:
             element_type = type(element).__name__
 
@@ -302,20 +315,31 @@ def separate_content_types(
 
             if element_type == "Image":
                 content_data["types"].append("image")
-                image_path = persist_base64_image(
-                    element.metadata.image_base64,
+                if asset_repository is None or user_id is None or document_id is None:
+                    continue
+                image_payload = decode_base64_image(
+                    getattr(element.metadata, "image_base64", None)
+                )
+                if image_payload is None:
+                    continue
+                mime_type = getattr(element.metadata, "image_mime_type", None)
+                if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+                    mime_type = "image/png"
+                checksum = hashlib.sha256(image_payload).hexdigest()
+                asset = asset_repository.store_asset(
                     user_id=user_id,
                     document_id=document_id,
+                    mime_type=mime_type,
+                    payload=image_payload,
+                    checksum=checksum,
                 )
-                if image_path:
-                    content_data["images"].append(
-                        build_image_entry(
-                            image_path,
-                            context_text=chunk_text,
-                            image_index=image_index,
-                        )
+                content_data["images"].append(
+                    build_image_entry(
+                        asset,
+                        image_payload,
+                        context_text=chunk_text,
                     )
-                    image_index += 1
+                )
 
     content_data["types"] = list(set(content_data["types"]))
     return content_data
@@ -351,7 +375,7 @@ def create_ai_enhanced_content(content_data: ContentData):
         if not isinstance(image_entry, dict):
             continue
         image_prompt += (
-            f"{image_entry.get('image_id', 'image')}: "
+            f"{image_entry.get('asset_id', 'image')}: "
             f"{image_entry.get('summary', 'Document image')} "
             f"(mime={image_entry.get('mime_type')})\n"
         )
@@ -399,6 +423,7 @@ def summarize_chunk(
     total_chunks: int,
     user_id: str | None = None,
     document_id: str | None = None,
+    asset_repository: ImageAssetRepository | None = None,
     logger: Callable[[IngestionEvent], None] | None = None,
 ) -> Document:
     emit_log(logger, f"Summarizing chunk {current_chunk}/{total_chunks}")
@@ -407,6 +432,7 @@ def summarize_chunk(
         chunk,
         user_id=user_id,
         document_id=document_id,
+        asset_repository=asset_repository,
     )
 
     emit_log(logger, f"Types found: {content_data['types']}")
@@ -417,8 +443,7 @@ def summarize_chunk(
     if content_data["images"]:
         image_debug = [
             {
-                "image_id": image.get("image_id"),
-                "path": Path(str(image.get("path", ""))).name,
+                "asset_id": image.get("asset_id"),
                 "summary": image.get("summary"),
             }
             for image in content_data["images"]
@@ -449,11 +474,6 @@ def summarize_chunk(
             {
                 "raw_text": texts or "",
                 "tables_html": tables or [],
-                "image_paths": [
-                    image_entry.get("path")
-                    for image_entry in images or []
-                    if isinstance(image_entry, dict) and image_entry.get("path")
-                ],
                 "image_entries": images or [],
             }
         )
@@ -498,6 +518,7 @@ async def stream_ingest_pdf(
     file_name: str | None = None,
     user_id: str | None = None,
     document_id: str | None = None,
+    asset_repository: ImageAssetRepository | None = None,
     storage: PGVectorStore | None = None,
     vector_service: PostgresVectorService | None = None,
     store_name: str = "raggidy_docs",
@@ -564,6 +585,7 @@ async def stream_ingest_pdf(
                 total_chunks=total_chunks,
                 user_id=user_id,
                 document_id=document_id,
+                asset_repository=asset_repository,
                 logger=logger,
             )
         )

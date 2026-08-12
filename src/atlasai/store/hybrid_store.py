@@ -1,6 +1,5 @@
 from collections.abc import Iterable, Sequence
 from logging import Logger
-from sys import prefix
 
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
@@ -102,21 +101,44 @@ class PostgresVectorService:
                 {"user_id": user_id},
             )
 
-    async def _init_store(self, table_name: str) -> None:
-        if self.pg_engine is None:
+    async def adelete_by_document(
+        self,
+        *,
+        table_name: str,
+        user_id: str,
+        document_id: str,
+    ) -> None:
+        """Delete rows for one owned document before an idempotent retry."""
+
+        if self.engine is None:
             raise RuntimeError("Vector service startup must run before use.")
 
-        try:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"DELETE FROM {table_name} "
+                    "WHERE langchain_metadata->>'user_id' = :user_id "
+                    "AND langchain_metadata->>'document_id' = :document_id"
+                ),
+                {"user_id": user_id, "document_id": document_id},
+            )
+
+    async def _init_store(self, table_name: str) -> None:
+        if self.pg_engine is None or self.engine is None:
+            raise RuntimeError("Vector service startup must run before use.")
+
+        async with self.engine.connect() as conn:
+            existing_table = await conn.scalar(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": table_name},
+            )
+
+        if existing_table is None:
             await self.pg_engine.ainit_vectorstore_table(
                 table_name=table_name,
                 vector_size=1536,
                 hybrid_search_config=self.hybrid_search_config,
                 store_metadata=True,
-            )
-        except Exception:
-            self.logger.warning(
-                "Table %s already exists",
-                table_name
             )
 
         self._stores[table_name] = await PGVectorStore.create(

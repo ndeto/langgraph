@@ -1,8 +1,6 @@
 import json
 from typing import Any
 
-from atlasai.rag.image_payloads import image_file_to_data_url
-
 
 def read_json_field(value: Any) -> Any:
     if not isinstance(value, str):
@@ -74,23 +72,19 @@ def build_retrieved_image_assets(
     max_images: int = 3,
 ) -> list[dict[str, str]]:
     assets: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
+    seen_asset_ids: set[str] = set()
 
     for chunk in chunks:
         for image_entry in extract_image_entries(chunk):
-            image_path = str(image_entry.get("path", "")).strip()
-            if not image_path or image_path in seen_paths:
+            asset_id = str(image_entry.get("asset_id", "")).strip()
+            if not asset_id or asset_id in seen_asset_ids:
                 continue
 
-            seen_paths.add(image_path)
-            data_url = image_file_to_data_url(image_path)
-            if not data_url:
-                continue
-
+            seen_asset_ids.add(asset_id)
             mime_type = str(image_entry.get("mime_type", "image/png")).strip()
             assets.append(
                 {
-                    "asset_id": data_url,
+                    "asset_id": asset_id,
                     "mime_type": mime_type or "image/png",
                 }
             )
