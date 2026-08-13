@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { ConversationView } from "./components/ConversationView";
 import { DocumentStageCard } from "./components/DocumentStageCard";
@@ -72,6 +72,24 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    function handleKeyboardShortcut(event: KeyboardEvent) {
+      if (
+        !event.repeat &&
+        !session.isRotating &&
+        event.altKey &&
+        event.shiftKey &&
+        event.code === "KeyN"
+      ) {
+        event.preventDefault();
+        void handleRotateSession();
+      }
+    }
+
+    globalThis.addEventListener("keydown", handleKeyboardShortcut);
+    return () => globalThis.removeEventListener("keydown", handleKeyboardShortcut);
+  });
+
   if (session.state.status === "loading") {
     return (
       <main className="app-shell loading-shell">
@@ -127,9 +145,7 @@ function App() {
           upload={upload.state}
           open={showPanel}
           pinned={isPanelOpen}
-          rotatingSession={session.isRotating}
           onClose={() => setIsPanelOpen(false)}
-          onRotateSession={() => void handleRotateSession()}
         />
       </aside>
     </main>

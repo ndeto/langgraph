@@ -10,9 +10,7 @@ type DocumentStageCardProps = {
   upload: UploadState;
   open: boolean;
   pinned: boolean;
-  rotatingSession: boolean;
   onClose: () => void;
-  onRotateSession: () => void;
 };
 
 export function DocumentStageCard({
@@ -21,9 +19,7 @@ export function DocumentStageCard({
   upload,
   open,
   pinned,
-  rotatingSession,
   onClose,
-  onRotateSession,
 }: DocumentStageCardProps) {
   const logsRef = useRef<HTMLDivElement>(null);
   const latestLog = upload.logs[upload.logs.length - 1];
@@ -65,14 +61,6 @@ export function DocumentStageCard({
           <h2>Ingestion</h2>
         </div>
         <div className="panel-head-actions">
-          <button
-            className="panel-secondary-action"
-            type="button"
-            onClick={onRotateSession}
-            disabled={rotatingSession}
-          >
-            {rotatingSession ? "Starting..." : "New session"}
-          </button>
           {pinned ? (
             <button className="panel-close" type="button" onClick={onClose}>
               <span className="sr-only">Close panel</span>

@@ -575,7 +575,6 @@ h3 {
 }
 
 .attachment-button,
-.panel-secondary-action,
 .send-button,
 .panel-toggle {
   border: 1px solid var(--border);
@@ -586,32 +585,21 @@ h3 {
 }
 
 .attachment-button,
-.panel-secondary-action,
 .send-button {
   border-radius: 6px;
 }
 
 .attachment-button,
-.panel-secondary-action,
 .send-button:hover:not(:disabled) {
   border-color: rgba(0, 109, 221, 0.44);
 }
 
-.attachment-button,
-.panel-secondary-action {
+.attachment-button {
   padding: 7px 12px;
 }
 
 .attachment-button {
   font-size: 0.92rem;
-}
-
-.panel-secondary-action {
-  padding: 6px 10px;
-  color: var(--muted);
-  font-size: 0.88rem;
-  font-weight: 500;
-  background: transparent;
 }
 
 .send-button {
