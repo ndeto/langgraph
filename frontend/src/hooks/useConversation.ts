@@ -30,24 +30,28 @@ function createAssistantMessage(): ConversationMessage {
   };
 }
 
-function appendAssetsToLatestAssistant(
+function setAssetsOnLatestAssistant(
   current: ConversationMessage[],
   assets: ConversationMessage["assets"],
 ): ConversationMessage[] {
+  const uniqueAssets = Array.from(
+    new Map(assets.map((asset) => [asset.assetId, asset])).values(),
+  );
+
   for (let index = current.length - 1; index >= 0; index -= 1) {
     const message = current[index];
-    if (message.role !== "assistant") {
+    if (message.role !== "assistant" || message.status !== "streaming") {
       continue;
     }
 
     return current.map((entry, entryIndex) =>
       entryIndex === index
-        ? { ...entry, assets: [...entry.assets, ...assets] }
+        ? { ...entry, assets: uniqueAssets }
         : entry,
     );
   }
 
-  return [...current, { ...createAssistantMessage(), assets }];
+  return [...current, { ...createAssistantMessage(), assets: uniqueAssets }];
 }
 
 function mapPersistedMessage(message: PersistedThreadMessage): ConversationMessage {
@@ -175,7 +179,7 @@ export function useConversation(options: Options) {
     }
 
     if (event.type === "sources") {
-      setMessages((current) => appendAssetsToLatestAssistant(current, event.assets));
+      setMessages((current) => setAssetsOnLatestAssistant(current, event.assets));
       return;
     }
 
@@ -228,6 +232,7 @@ export function useConversation(options: Options) {
         status: "done",
         assets: [],
       },
+      createAssistantMessage(),
     ]);
     setIsStreaming(true);
     setStreamStage("Atlas AI is reasoning through the request.");

@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 
+# macOS Finder metadata
+.DS_Store
+
 # Virtual environments
 .venv
 
@@ -24,6 +27,10 @@ db/
 .vscode/
 __pycache__/
 internal/
+infra/
 .code-workspace
 src/atlasai/service/atlasai.code-workspace
 tmp/
+
+# Vite production output
+src/atlasai/web/static/

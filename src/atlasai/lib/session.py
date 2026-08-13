@@ -37,5 +37,4 @@ class StateContext(TypedDict, total=False):
     available_tools_metadata: list | None
     resolved_tools: list[str]
     summary: str | None
-    selected_image_assets: list[dict] | None
     usage_payload: dict | None

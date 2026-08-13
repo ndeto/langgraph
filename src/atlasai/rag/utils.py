@@ -71,10 +71,23 @@ def build_retrieved_image_assets(
     *,
     max_images: int = 3,
 ) -> list[dict[str, str]]:
+    """Return images from retrieved chunks in the top-ranked document."""
+
     assets: list[dict[str, str]] = []
     seen_asset_ids: set[str] = set()
+    primary_document_id = None
+    if chunks:
+        first_metadata = getattr(chunks[0], "metadata", {}) or {}
+        primary_document_id = first_metadata.get("document_id")
 
     for chunk in chunks:
+        metadata = getattr(chunk, "metadata", {}) or {}
+        if (
+            primary_document_id is not None
+            and metadata.get("document_id") != primary_document_id
+        ):
+            continue
+
         for image_entry in extract_image_entries(chunk):
             asset_id = str(image_entry.get("asset_id", "")).strip()
             if not asset_id or asset_id in seen_asset_ids:

@@ -484,6 +484,21 @@ h3 {
   margin-top: 0.65rem;
 }
 
+.related-images {
+  margin-top: 18px;
+}
+
+.related-images h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.related-images p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 .asset-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));

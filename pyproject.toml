@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.18.5",
     "beautifulsoup4>=4.15.0",
     "ipython>=9.15.0",
     "langfuse>=3.2.2",
@@ -20,7 +21,9 @@ dependencies = [
     "numpy>=2.4.6",
     "python-dotenv>=1.2.2",
     "requests>=2.34.2",
-    "unstructured[all-docs]==0.24.1",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "unstructured[pdf]==0.24.1",
     "graphviz>=0.21",
     "pygraphviz>=2.0",
     "langgraph-checkpoint>=4.1.1",
@@ -41,7 +44,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "alembic>=1.18.5",
     "httpx2>=2.9.1",
     "pyright>=1.1.411",
     "ruff>=0.15.21",
@@ -49,6 +51,15 @@ dev = [
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.setuptools]
 package-dir = {"" = "src"}

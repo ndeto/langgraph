@@ -93,6 +93,23 @@ class RagImagesGraphService(GraphRunner):
         yield {"type": "final", "data": {"messages": []}}
 
 
+class TurnScopedSourcesGraphService(GraphRunner):
+    def __init__(self) -> None:
+        self.run_count = 0
+
+    async def stream(self, _) -> AsyncIterator[object]:
+        self.run_count += 1
+        yield {"type": "token", "data": f"Answer {self.run_count}"}
+        if self.run_count == 1:
+            yield {
+                "type": "sources",
+                "data": [
+                    {"asset_id": "first-turn-image", "mime_type": "image/png"}
+                ],
+            }
+        yield {"type": "final", "data": {"messages": []}}
+
+
 class CapturePayloadGraphService(GraphRunner):
     def __init__(self) -> None:
         self.payloads: list[object] = []
@@ -678,6 +695,50 @@ class TestWeb(TestCase):
         assistant_message = restored.json()["messages"][1]
         self.assertEqual(assistant_message["content"], "Answer text")
         self.assertNotIn("data:image/", assistant_message["content"])
+
+    def test_thread_images_are_scoped_to_the_turn_that_retrieved_them(self):
+        app = create_app(
+            TurnScopedSourcesGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        session_response = test_client.get("/api/v1/session")
+        cookie_value = session_response.cookies.get("atlas_demo_session")
+        thread_response = test_client.post(
+            "/api/v1/threads",
+            cookies={"atlas_demo_session": cookie_value},
+        )
+        thread_cookie = thread_response.cookies.get("atlas_demo_session")
+        messages_url = (
+            f"/api/v1/threads/{thread_response.json()['thread_id']}/messages"
+        )
+
+        test_client.post(
+            messages_url,
+            cookies={"atlas_demo_session": thread_cookie},
+            json={"user_input": "First question"},
+        )
+        test_client.post(
+            messages_url,
+            cookies={"atlas_demo_session": thread_cookie},
+            json={"user_input": "Different question"},
+        )
+        restored = test_client.get(
+            f"/api/v1/threads/{thread_response.json()['thread_id']}",
+            cookies={"atlas_demo_session": thread_cookie},
+        )
+
+        assistant_messages = [
+            message
+            for message in restored.json()["messages"]
+            if message["role"] == "assistant"
+        ]
+        self.assertEqual(
+            assistant_messages[0]["assets"],
+            [{"asset_id": "first-turn-image", "mime_type": "image/png"}],
+        )
+        self.assertIsNone(assistant_messages[1]["assets"])
 
     def test_thread_messages_emit_error_event(self):
         app = create_app(

@@ -110,6 +110,39 @@ class AssetsTest(unittest.TestCase):
             [{"asset_id": "asset-1", "mime_type": "image/png"}],
         )
 
+    def test_retrieved_images_only_come_from_the_top_ranked_document(self) -> None:
+        chunks = [
+            SimpleNamespace(
+                metadata={
+                    "document_id": "document-1",
+                    "original_content": '{"image_entries": []}',
+                }
+            ),
+            SimpleNamespace(
+                metadata={
+                    "document_id": "document-2",
+                    "original_content": (
+                        '{"image_entries": [{"asset_id": "unrelated-image", '
+                        '"mime_type": "image/png"}]}'
+                    ),
+                }
+            ),
+            SimpleNamespace(
+                metadata={
+                    "document_id": "document-1",
+                    "original_content": (
+                        '{"image_entries": [{"asset_id": "related-image", '
+                        '"mime_type": "image/jpeg"}]}'
+                    ),
+                }
+            ),
+        ]
+
+        self.assertEqual(
+            build_retrieved_image_assets(chunks),
+            [{"asset_id": "related-image", "mime_type": "image/jpeg"}],
+        )
+
     def test_asset_endpoint_enforces_session_ownership(self) -> None:
         app = create_app(
             FakeGraphService(),

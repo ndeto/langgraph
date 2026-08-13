@@ -440,20 +440,6 @@ def summarize_chunk(
         logger,
         f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}",
     )
-    if content_data["images"]:
-        image_debug = [
-            {
-                "asset_id": image.get("asset_id"),
-                "summary": image.get("summary"),
-            }
-            for image in content_data["images"]
-            if isinstance(image, dict)
-        ]
-        print(
-            f"[RAG Images] chunk {current_chunk}/{total_chunks} extracted: "
-            f"{json.dumps(image_debug, ensure_ascii=True)}",
-            flush=True,
-        )
 
     emit_log(logger, "Creating AI enhance summary")
     tables = content_data.get("tables")

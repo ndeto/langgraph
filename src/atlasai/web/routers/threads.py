@@ -173,15 +173,14 @@ async def post_thread_message(
                 if isinstance(chunk, dict) and chunk.get("type") == "sources":
                     assets = chunk.get("data")
                     if isinstance(assets, list):
-                        logger.info(
-                            "thread_stream_sources thread_id=%s trace_id=%s assets=%s",
-                            thread.thread_id,
-                            request_context.trace_id,
-                            assets,
+                        assistant_assets = list(
+                            {
+                                asset.get("asset_id"): asset
+                                for asset in assets
+                                if isinstance(asset, dict)
+                                and isinstance(asset.get("asset_id"), str)
+                            }.values()
                         )
-                        for asset in assets:
-                            if isinstance(asset, dict):
-                                assistant_assets.append(asset)
                 if isinstance(chunk, dict) and chunk.get("type") == "final":
                     usage_payload = extract_usage_payload(chunk.get("data"))
                     record = usage_record_from_callback(
@@ -199,12 +198,6 @@ async def post_thread_message(
                         record=record,
                     )
                     if assistant_text_parts or assistant_assets:
-                        logger.info(
-                            "thread_persist_assistant_assets thread_id=%s trace_id=%s assets=%s",
-                            thread.thread_id,
-                            request_context.trace_id,
-                            assistant_assets,
-                        )
                         thread_service.append_owned_message(
                             user_id=request_context.session.session.user_id,
                             thread_id=thread.thread_id,
@@ -247,12 +240,6 @@ async def post_thread_message(
                     record=record,
                 )
                 if assistant_text_parts or assistant_assets:
-                    logger.info(
-                        "thread_persist_assistant_assets thread_id=%s trace_id=%s assets=%s",
-                        thread.thread_id,
-                        request_context.trace_id,
-                        assistant_assets,
-                    )
                     thread_service.append_owned_message(
                         user_id=request_context.session.session.user_id,
                         thread_id=thread.thread_id,

@@ -119,8 +119,8 @@ class GraphService(GraphRunner):
             search_user_info,
             self.get_crypto_prices,
             *math_tools,
-            create_manage_memory_tool(namespace=("memories")),
-            create_search_memory_tool(namespace=("memories")),
+            create_manage_memory_tool(namespace=("memories", "{langgraph_user_id}")),
+            create_search_memory_tool(namespace=("memories", "{langgraph_user_id}")),
         ]
         self._tools_by_name = {tool.name: tool for tool in self.tools_list}
 
@@ -207,13 +207,7 @@ class GraphService(GraphRunner):
             user_input, rag_res, "knowledge-base"
         )
         related_image_assets = build_retrieved_image_assets(rag_res)
-        logger.info(
-            "rag_image_assets trace_id=%s user_id=%s retrieved_chunks=%s assets=%s",
-            trace_id,
-            user_id,
-            len(rag_res),
-            related_image_assets,
-        )
+        runtime.stream_writer({"type": "sources", "data": related_image_assets})
 
         history = state.get("messages") or []
         system_context = "\n\n".join(
@@ -305,7 +299,6 @@ class GraphService(GraphRunner):
 
         return {
             "messages": [response],
-            "selected_image_assets": related_image_assets or None,
             "usage_payload": usage_payload,
         }
 
@@ -375,19 +368,33 @@ class GraphService(GraphRunner):
 
         return builder
 
-    def build_graph_config(self, thread_id: str, run_name: str):
+    def build_graph_config(
+        self,
+        thread_id: str,
+        run_name: str,
+        *,
+        user_id: str | None = None,
+    ):
+        configurable: dict[str, str] = {"thread_id": thread_id}
+        if user_id:
+            configurable["langgraph_user_id"] = user_id
+
         config: RunnableConfig = {
-            "configurable": {"thread_id": thread_id},
+            "configurable": configurable,
             "run_name": run_name,
         }
 
         return config
 
-    async def run_summarizer(self, thread_id: str) -> None:
+    async def run_summarizer(self, thread_id: str, user_id: str | None = None) -> None:
         if self.graph is None:
             raise RuntimeError("Graph service startup must run before summarizer use.")
 
-        config = self.build_graph_config(thread_id, "atlasai-thread-summary")
+        config = self.build_graph_config(
+            thread_id,
+            "atlasai-thread-summary",
+            user_id=user_id,
+        )
         state_snapshot = await self.graph.aget_state(config)
         state = cast(StateContext, state_snapshot.values)
         summarize_messages = self._messages_to_summarize(state.get("messages") or [])
@@ -449,6 +456,7 @@ class GraphService(GraphRunner):
         query = payload["user_input"]
         thread_id = payload["thread_id"]
         trace_id = payload.get("trace_id") or thread_id
+        user_id = payload.get("user_id")
         try:
             current_state: StateContext = {
                 "user_input": query,
@@ -456,7 +464,6 @@ class GraphService(GraphRunner):
                 "trace_id": trace_id,
                 "messages": [HumanMessage(content=query)],
             }
-            user_id = payload.get("user_id")
             if user_id is not None:
                 current_state["user_id"] = user_id
             if "document_id" in payload:
@@ -464,10 +471,15 @@ class GraphService(GraphRunner):
 
             last_state: StateContext | None = None
             latest_usage_payload: object | None = None
+            latest_image_assets: list[dict] = []
 
             async for chunk in self.graph.astream(
                 current_state,
-                config=self.build_graph_config(thread_id, "atlas-main"),
+                config=self.build_graph_config(
+                    thread_id,
+                    "atlas-main",
+                    user_id=user_id,
+                ),
                 version="v2",
                 stream_mode=["custom", "messages", "values"],
             ):
@@ -483,6 +495,13 @@ class GraphService(GraphRunner):
                         and status.get("type") == "usage_payload"
                     ):
                         latest_usage_payload = status.get("data")
+                    elif isinstance(status, dict) and status.get("type") == "sources":
+                        assets = status.get("data")
+                        latest_image_assets = (
+                            [asset for asset in assets if isinstance(asset, dict)]
+                            if isinstance(assets, list)
+                            else []
+                        )
                 elif chunk["type"] == "messages":
                     # Stream Node Status
                     message, metadata = chunk["data"]
@@ -494,9 +513,8 @@ class GraphService(GraphRunner):
                         yield {"type": "token", "data": token}
 
             if last_state is not None:
-                selected_image_assets = last_state.get("selected_image_assets")
-                if isinstance(selected_image_assets, list) and selected_image_assets:
-                    yield {"type": "sources", "data": selected_image_assets}
+                if latest_image_assets:
+                    yield {"type": "sources", "data": latest_image_assets}
 
                 final_state: StateContext = last_state
                 if latest_usage_payload is not None and not last_state.get(
@@ -506,7 +524,9 @@ class GraphService(GraphRunner):
 
                 yield {"type": "final", "data": final_state}
 
-                summary_task = asyncio.create_task(self.run_summarizer(thread_id))
+                summary_task = asyncio.create_task(
+                    self.run_summarizer(thread_id, user_id)
+                )
                 summary_task.add_done_callback(self._log_background_task)
 
         except Exception as e:

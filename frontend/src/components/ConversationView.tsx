@@ -96,16 +96,20 @@ export function ConversationView({
                       {assistantBody}
                     </ReactMarkdown>
                     {message.assets.length ? (
-                      <div className="asset-grid">
-                        {message.assets.map((asset) => (
-                          <img
-                            key={asset.assetId}
-                            src={assetSource(asset.assetId)}
-                            alt="Retrieved source"
-                            loading="lazy"
-                          />
-                        ))}
-                      </div>
+                      <section className="related-images" aria-label="Related images">
+                        <h3>Related Images</h3>
+                        <p>Depends on the quality of the uploaded document.</p>
+                        <div className="asset-grid">
+                          {message.assets.map((asset) => (
+                            <img
+                              key={asset.assetId}
+                              src={assetSource(asset.assetId)}
+                              alt="Related document image"
+                              loading="lazy"
+                            />
+                          ))}
+                        </div>
+                      </section>
                     ) : null}
                   </div>
                 ) : (
