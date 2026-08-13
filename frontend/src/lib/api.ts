@@ -12,6 +12,8 @@ import type {
 } from "./types";
 
 const MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024;
+const MAX_USER_INPUT_CHARS = 8000;
+const USER_INPUT_TOO_LARGE_MESSAGE = "Message exceeds the 8,000 character limit.";
 
 type StreamHandlers = {
   onEvent: (event: ChatEvent) => void;
@@ -22,6 +24,33 @@ type UploadHandlers = {
   onEvent: (event: IngestionEvent) => void;
   signal?: AbortSignal;
 };
+
+type ErrorDetail = {
+  type?: unknown;
+  loc?: unknown;
+  msg?: unknown;
+  ctx?: unknown;
+};
+
+function isUserInputTooLargeDetail(detail: unknown): boolean {
+  if (!Array.isArray(detail)) {
+    return false;
+  }
+
+  return detail.some((item: ErrorDetail) => {
+    const loc = Array.isArray(item.loc) ? item.loc.map(String) : [];
+    const ctx = item.ctx && typeof item.ctx === "object" ? item.ctx : {};
+    const maxLength =
+      "max_length" in ctx && typeof ctx.max_length === "number"
+        ? ctx.max_length
+        : null;
+
+    return (
+      loc.includes("user_input") &&
+      (String(item.type).includes("too_long") || maxLength === MAX_USER_INPUT_CHARS)
+    );
+  });
+}
 
 function mapSession(payload: ReturnType<typeof sessionSchema.parse>): SessionData {
   const activeDocument =
@@ -77,6 +106,9 @@ async function readError(response: Response): Promise<string> {
     const payload = (await response.json()) as { detail?: unknown; message?: unknown };
     if (typeof payload.detail === "string") {
       return payload.detail;
+    }
+    if (isUserInputTooLargeDetail(payload.detail)) {
+      return USER_INPUT_TOO_LARGE_MESSAGE;
     }
     if (typeof payload.message === "string") {
       return payload.message;
@@ -191,6 +223,10 @@ export class AtlasApiClient {
     userInput: string,
     handlers: StreamHandlers,
   ): Promise<void> {
+    if (userInput.length > MAX_USER_INPUT_CHARS) {
+      throw new Error(USER_INPUT_TOO_LARGE_MESSAGE);
+    }
+
     if (thread.mode === "server") {
       const response = await atlasFetch(`/api/v1/threads/${thread.id}/messages`, {
         method: "POST",
@@ -221,6 +257,10 @@ export class AtlasApiClient {
     userInput: string,
     handlers: StreamHandlers,
   ): Promise<void> {
+    if (userInput.length > MAX_USER_INPUT_CHARS) {
+      throw new Error(USER_INPUT_TOO_LARGE_MESSAGE);
+    }
+
     const response = await atlasFetch("/invoke?stream_format=ndjson", {
       method: "POST",
       headers: {

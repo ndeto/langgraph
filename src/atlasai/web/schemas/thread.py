@@ -1,7 +1,10 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+MAX_USER_INPUT_CHARS = 8000
+USER_INPUT_TOO_LARGE_MESSAGE = "Message exceeds the 8,000 character limit."
 
 
 class ThreadMessageResponse(BaseModel):
@@ -34,7 +37,7 @@ class ThreadCreateRequest(BaseModel):
 class ThreadMessageRequest(BaseModel):
     """Thread message request."""
 
-    user_input: str
+    user_input: str = Field(..., max_length=MAX_USER_INPUT_CHARS)
 
 
 class StatusEvent(BaseModel):

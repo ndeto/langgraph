@@ -45,6 +45,10 @@ from atlasai.web.routers import (
     session_router,
     threads_router,
 )
+from atlasai.web.schemas.thread import (
+    MAX_USER_INPUT_CHARS,
+    USER_INPUT_TOO_LARGE_MESSAGE,
+)
 from atlasai.web.streaming import (
     extract_usage_payload,
     format_graph_chunk,
@@ -200,6 +204,16 @@ def create_app(
         stream_format: StreamFormat = "text",
     ):
         """Execute one agent request as text or NDJSON streaming output."""
+
+        if len(input["user_input"]) > MAX_USER_INPUT_CHARS:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "detail": USER_INPUT_TOO_LARGE_MESSAGE,
+                    "code": "input_too_large",
+                },
+                headers={"X-Trace-Id": request_context.trace_id},
+            )
 
         admission = quota_service.claim_question(
             user_id=request_context.session.session.user_id

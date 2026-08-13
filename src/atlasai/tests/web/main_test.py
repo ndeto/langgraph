@@ -24,6 +24,7 @@ from atlasai.infrastructure.worker import (
 )
 from atlasai.service.contracts import GraphRunner
 from atlasai.web.main import create_app
+from atlasai.web.schemas.thread import MAX_USER_INPUT_CHARS
 from atlasai.web.streaming import extract_usage_payload
 
 
@@ -276,6 +277,65 @@ class TestWeb(TestCase):
             },
         )
         self.assertIn("x-trace-id", res.headers)
+
+    def test_invoke_rejects_oversized_user_input_before_quota(self):
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        test_client.get("/api/v1/session")
+
+        res = test_client.post(
+            "/invoke",
+            json={
+                "user_input": "x" * (MAX_USER_INPUT_CHARS + 1),
+                "thread_id": "test-thread",
+            },
+        )
+
+        self.assertEqual(res.status_code, 413)
+        self.assertEqual(
+            res.json(),
+            {
+                "detail": "Message exceeds the 8,000 character limit.",
+                "code": "input_too_large",
+            },
+        )
+        self.assertEqual(
+            app.state.repositories.quotas.get_client_snapshot(
+                client_key="anonymous-browser"
+            ).questions_used,
+            0,
+        )
+
+    def test_thread_message_rejects_oversized_user_input(self):
+        app = create_app(
+            FakeGraphService(),
+            FakeVectorService(),
+            build_in_memory_repository_bundle(),
+        )
+        test_client = TestClient(app)
+        session_response = test_client.get("/api/v1/session")
+        cookie_value = session_response.cookies.get("atlas_demo_session")
+        thread_response = test_client.post(
+            "/api/v1/threads",
+            cookies={"atlas_demo_session": cookie_value},
+        )
+
+        res = test_client.post(
+            f"/api/v1/threads/{thread_response.json()['thread_id']}/messages",
+            cookies={
+                "atlas_demo_session": thread_response.cookies.get(
+                    "atlas_demo_session"
+                )
+            },
+            json={"user_input": "x" * (MAX_USER_INPUT_CHARS + 1)},
+        )
+
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("user_input", str(res.json()["detail"]))
 
     def test_documents_reject_when_upload_quota_is_exhausted(self):
         app = create_app(
