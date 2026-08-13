@@ -1,3 +1,5 @@
+"""Shared request and execution contracts for graph-backed services."""
+
 from collections.abc import AsyncIterator
 from typing import Protocol
 
@@ -5,6 +7,8 @@ from typing_extensions import NotRequired, TypedDict
 
 
 class InvokePayload(TypedDict):
+    """Trusted input required to execute one graph turn."""
+
     user_input: str
     thread_id: str
     user_id: NotRequired[str]
@@ -18,4 +22,7 @@ class GraphRunner(Protocol):
     def stream(
         self,
         payload: InvokePayload,
-    ) -> AsyncIterator[object]: ...
+    ) -> AsyncIterator[object]:
+        """Stream events produced while executing one graph turn."""
+
+        ...

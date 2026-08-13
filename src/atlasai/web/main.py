@@ -1,3 +1,5 @@
+"""FastAPI application construction, lifecycle management, and core endpoints."""
+
 import inspect
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -62,6 +64,8 @@ StreamFormat = Literal["text", "ndjson"]
 
 
 async def _run_lifecycle_hook(hook: object) -> None:
+    """Our asynchronous lifecycle hook."""
+
     if not callable(hook):
         return
     result = cast(LifecycleHook, hook)()
@@ -74,8 +78,12 @@ def create_app(
     vector_service: PostgresVectorService | None = None,
     repositories: PostgresRepositoryBundle | InMemoryRepositoryBundle | None = None,
 ) -> FastAPI:
+    """Build the API and warm shared services"""
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        """Start and stop repositories, vector storage, and graph execution."""
+
         warmed_vector_service = vector_service or PostgresVectorService()
         warmed_repositories = repositories or PostgresRepositoryBundle()
         vector_startup = getattr(warmed_vector_service, "startup", None)
@@ -130,6 +138,8 @@ def create_app(
 
     @app.middleware("http")
     async def attach_request_identity(request, call_next):
+        """Attach quota identity and enforce configured operating hours"""
+
         request.state.request_key_hash = build_request_key_hash(
             request,
             app.state.demo_web_settings,
@@ -189,6 +199,8 @@ def create_app(
         usage_service: Annotated[UsageService, Depends(get_usage_service)],
         stream_format: StreamFormat = "text",
     ):
+        """Execute one agent request as text or NDJSON streaming output."""
+
         admission = quota_service.claim_question(
             user_id=request_context.session.session.user_id
         )

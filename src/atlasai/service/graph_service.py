@@ -1,3 +1,5 @@
+"""LangGraph agent orchestration, retrieval, tools, and conversation persistence."""
+
 import asyncio
 import logging
 import tracemalloc
@@ -155,6 +157,8 @@ class GraphService(GraphRunner):
             await self.checkpointer_ctx.__aexit__(None, None, None)
 
     def retrieve_tools(self, tool_names: list[str]):
+        """Resolve registered tools by name while preserving request order."""
+
         return [
             self._tools_by_name[tool_name]
             for tool_name in dict.fromkeys(tool_names)
@@ -162,6 +166,8 @@ class GraphService(GraphRunner):
         ]
 
     async def tool_resolver_node(self, state: StateContext, runtime: Runtime[Context]):
+        """Select the tools relevant to the current user request."""
+
         query = state.get("user_input")
         if not query:
             return {"resolved_tools": []}
@@ -182,6 +188,8 @@ class GraphService(GraphRunner):
         return {"resolved_tools": tool_names}
 
     async def agent_llm_node(self, state: StateContext, runtime: Runtime[Context]):
+        """Assemble agent context, retrieve documents, and invoke the model."""
+
         context = runtime.context or {
             "user_instruction_prompt": self.sys_config["user_instruction_prompt"],
             "soul": self.sys_config["soul"],
@@ -321,6 +329,8 @@ class GraphService(GraphRunner):
         return []
 
     async def summarize_conversation_node(self, state: StateContext):
+        """Summarize older thread messages into compact checkpoint context."""
+
         messages = state.get("messages") or []
         summarize_messages = self._messages_to_summarize(messages)
         if not summarize_messages:
@@ -354,6 +364,8 @@ class GraphService(GraphRunner):
         }
 
     def build_main_graph(self):
+        """Build the tool-resolving agent execution loop."""
+
         tool_node = ToolNode(self.tools_list)
         builder = StateGraph(state_schema=StateContext, context_schema=Context)
         builder.add_node("tool_resolver", self.tool_resolver_node)
@@ -375,6 +387,8 @@ class GraphService(GraphRunner):
         *,
         user_id: str | None = None,
     ):
+        """Build thread- and user-scoped run config."""
+
         configurable: dict[str, str] = {"thread_id": thread_id}
         if user_id:
             configurable["langgraph_user_id"] = user_id
@@ -387,6 +401,8 @@ class GraphService(GraphRunner):
         return config
 
     async def run_summarizer(self, thread_id: str, user_id: str | None = None) -> None:
+        """Summarize and prune older messages."""
+
         if self.graph is None:
             raise RuntimeError("Graph service startup must run before summarizer use.")
 
@@ -450,6 +466,8 @@ class GraphService(GraphRunner):
         self,
         payload: InvokePayload,
     ) -> AsyncIterator[object]:
+        """Run one graph turn and stream status, tokens, sources, and final state."""
+
         if self.graph is None:
             raise RuntimeError("Graph service startup must run before streaming.")
 
