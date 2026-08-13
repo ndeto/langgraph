@@ -1,23 +1,24 @@
 # AtlasAI
 
-Disclaimer: AtlasAI's LangGraph, Python, FastAPI, retrieval, and memory backend was engineered manually. AI assistance was used only for the frontend UI scaffold.
+Disclaimer: This agent's LangGraph, Python, FastAPI, retrieval, and memory backend was engineered manually. AI assistance was used only for the frontend UI scaffold.
 
-AtlasAI is a production-leaning AI agent built with FastAPI, LangGraph, LangChain, and Postgres. It is meant to show applied agent engineering work:
+Find a full article on this project on [medium](https://medium.com/@ndeto/building-ai-agents-graph-loops-memory-retrieval-rag-bf2490930834)
 
-- graph-based orchestration
+AtlasAI is a long running conversational AI agent built with FastAPI, LangGraph, LangChain, and Postgres. The project focuses on a practical agent architecture. It features:
+
+- graph-based orchestration using langGraph
 - real retrieval infrastructure with Postgres hybrid search
 - memory management beyond short chat history
 - ingestion pipelines for both documents and websites
 - an HTTP service layer that can evolve into a deployable backend
 
 
-The project focuses on a practical agent architecture. It combines tool use, hybrid retrieval, long-term memory, and advanced document ingestion into one system that can be invoked over HTTP.
 
 ## What It Does
 
-- Runs a LangGraph-based conversational agent behind a FastAPI API.
-- Uses hybrid retrieval with `PGVectorStore` on Postgres and `pgvector`.
-- Supports advanced document RAG with PDF partitioning, chunking, summarization, and metadata preservation.
+- Runs a LangGraph-based conversational agent behind a FastAPI API and Vite FrontEnd.
+- Uses hybrid search retrieval with `PGVectorStore` on Postgres and `pgvector`.
+- Supports advanced document ingestion using [Unstructured](https://unstructured.io) libraries
 - Ingests indexed website content into a searchable store for profile and biography lookups.
 - Maintains long-term conversational memory with LangMem and a background memory update flow.
 - Persists graph state with a Postgres checkpointer for thread-aware conversations.
@@ -26,31 +27,51 @@ The project focuses on a practical agent architecture. It combines tool use, hyb
 
 AtlasAI is split into a few main layers:
 
-- `src/atlasai/web/main.py`
-  FastAPI entrypoint with the `/invoke` endpoint.
-- `src/atlasai/service/graph_service.py`
-  Main agent orchestration, tool routing, memory extraction, and graph execution.
-- `src/atlasai/store/hybrid_store.py`
-  Postgres-backed `PGVectorStore` setup with built-in hybrid search configuration.
-- `src/atlasai/rag/rag_ingestion.py`
-  PDF ingestion pipeline for partitioning, chunking, summarizing, and storing documents.
-- `src/atlasai/rag/website.py`
-  Website ingestion flow for loading and storing HTML content.
+```text
+                    +--------------------------------+
+                    | FastAPI HTTP boundary          |
+                    | src/atlasai/web/main.py        |
+                    +---------------+----------------+
+                                    |
+                                    v
+                    +--------------------------------+
+                    | Agent graph service            |
+                    | src/atlasai/service/           |
+                    | graph_service.py               |
+                    +---------------+----------------+
+                                    |
+                  +-----------------+-----------------+
+                  |                                   |
+                  v                                   v
++--------------------------------+   +--------------------------------+
+| Hybrid retrieval store         |   | Ingestion pipelines            |
+| src/atlasai/store/             |   | src/atlasai/rag/               |
+| hybrid_store.py                |   | rag_ingestion.py               |
+|                                |   | website.py                     |
++---------------+----------------+   +---------------+----------------+
+                |                                    |
+                v                                    v
++--------------------------------+   +--------------------------------+
+| Postgres + pgvector            |   | PDFs and website HTML          |
+| PGVectorStore + hybrid search  |   | partition, chunk, summarize    |
++--------------------------------+   +--------------------------------+
+```
+
 
 ## Retrieval and Memory
 
-This project uses a hybrid retrieval setup rather than vector-only search.
+This project uses a hybrid search retrieval setup rather than vector-only search.
 
-- Dense retrieval is handled by `PGVectorStore`.
+- Dense retrieval is handled by [`PGVectorStore`](https://docs.langchain.com/oss/python/integrations/vectorstores/pgvectorstore).
 - Keyword retrieval is handled by Postgres full-text search through a `tsvector` column.
-- Result fusion uses reciprocal rank fusion (`RRF`).
+- Result fusion uses [reciprocal rank fusion](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking) (`RRF`).
 
 The agent also maintains memory in two forms:
 
 - LangGraph checkpointing for thread-level conversational state.
-- Long-term memory tools and a background memory graph for durable user facts and preferences.
+- Long-term memory tools provided by [LangMem](https://langchain-ai.github.io/langmem/)
 
-## Document RAG
+## Document Ingestion
 
 The document pipeline is designed for more than plain text extraction.
 
@@ -101,19 +122,15 @@ DB_CONN=postgresql://atlasai:atlasai@localhost:55433/atlasai
 PGVECTOR_CONNECTION=postgresql+psycopg://atlasai:atlasai@localhost:55433/atlasai
 ```
 
-Run database migrations:
-
-```bash
-uv run alembic upgrade head
-```
-
 ## Running
 
 Start the app:
 
 ```bash
-uv run fastapi dev src/atlasai/web/main.py
+./scripts/start_web.sh
 ```
+
+The script runs migrations, builds the frontend into `src/atlasai/web/static`, starts FastAPI, and starts the ingestion worker.
 
 Then open the UI in your browser:
 
