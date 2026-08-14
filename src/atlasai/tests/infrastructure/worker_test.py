@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -119,6 +120,48 @@ class WorkerHardeningTest(unittest.TestCase):
             )
 
         self.assertEqual(repositories.documents.get_job(job_id=job.job_id).state, "ready")
+        self.assertEqual(vector_service.deleted_documents, [("user-1", document.document_id)])
+        self.assertFalse(Path(source_path).exists())
+
+    def test_stale_exhausted_ingestion_job_fails_permanently(self):
+        repositories = build_in_memory_repository_bundle()
+        vector_service = _VectorService()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as staged:
+            staged.write(b"%PDF-1.4")
+            source_path = staged.name
+        document, job = repositories.documents.create_job(
+            user_id="user-1",
+            filename="sample.pdf",
+            size_bytes=8,
+            ttl_seconds=3600,
+            source_path=source_path,
+        )
+        stored_job = repositories.documents.get_job(job_id=job.job_id)
+        assert stored_job is not None
+        stored_job.state = "processing"
+        stored_job.attempts = 3
+        stored_job.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
+
+        processed = asyncio.run(
+            process_next_ingestion_job(
+                repositories,
+                vector_service,  # type: ignore[arg-type]
+                settings=WorkerSettings(
+                    poll_seconds=0.01,
+                    cleanup_poll_seconds=0.01,
+                    heartbeat_timeout_seconds=60,
+                    max_attempts=3,
+                    heartbeat_seconds=0.01,
+                ),
+            )
+        )
+
+        failed_job = repositories.documents.get_job(job_id=job.job_id)
+        assert failed_job is not None
+        self.assertTrue(processed)
+        self.assertEqual(failed_job.state, "failed")
+        self.assertEqual(failed_job.events[-1].payload["type"], "failed")
+        self.assertIn("failed after 3 attempts", failed_job.events[-1].payload["text"])
         self.assertEqual(vector_service.deleted_documents, [("user-1", document.document_id)])
         self.assertFalse(Path(source_path).exists())
 

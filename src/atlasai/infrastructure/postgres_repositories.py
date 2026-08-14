@@ -1342,6 +1342,61 @@ class PostgresDocumentRepository:
                 payload={"type": "processing", "text": "Retrying ingestion."},
             )
 
+    def fail_stale_exhausted_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+        text: str,
+    ) -> IngestionJobRecord | None:
+        stale_before = _utcnow() - timedelta(seconds=heartbeat_timeout_seconds)
+        with self.engine.begin() as conn:
+            row = (
+                conn.execute(
+                    select(ingestion_jobs_table)
+                    .where(
+                        and_(
+                            ingestion_jobs_table.c.state == "processing",
+                            ingestion_jobs_table.c.heartbeat_at.is_not(None),
+                            ingestion_jobs_table.c.heartbeat_at < stale_before,
+                            ingestion_jobs_table.c.attempts >= max_attempts,
+                            ingestion_jobs_table.c.expires_at > _utcnow(),
+                        )
+                    )
+                    .order_by(ingestion_jobs_table.c.created_at.asc())
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return None
+
+            now = _utcnow()
+            conn.execute(
+                update(ingestion_jobs_table)
+                .where(ingestion_jobs_table.c.job_id == row["job_id"])
+                .values(
+                    state="failed",
+                    heartbeat_at=None,
+                    updated_at=now,
+                    failure_text=text,
+                )
+            )
+            conn.execute(
+                update(documents_table)
+                .where(documents_table.c.document_id == row["document_id"])
+                .values(status="failed")
+            )
+            self._append_event(
+                conn,
+                job_id=row["job_id"],
+                payload={"type": "failed", "text": text},
+            )
+
+        return self.get_job(job_id=row["job_id"])
+
     @staticmethod
     def _append_event(conn, *, job_id: str, payload: dict) -> None:
         next_event_id = (

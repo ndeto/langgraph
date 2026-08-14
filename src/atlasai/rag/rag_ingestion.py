@@ -309,6 +309,7 @@ def separate_content_types(
     user_id: str | None = None,
     document_id: str | None = None,
     asset_repository: ImageAssetRepository | None = None,
+    logger: Callable[[IngestionEvent], None] | None = None,
 ) -> ContentData:
     """Analyze what kind of content is in a chunk"""
     chunk_text = extract_chunk_text(chunk)
@@ -356,13 +357,31 @@ def separate_content_types(
                 if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
                     mime_type = "image/png"
                 checksum = hashlib.sha256(image_payload).hexdigest()
-                asset = asset_repository.store_asset(
-                    user_id=user_id,
-                    document_id=document_id,
-                    mime_type=mime_type,
-                    payload=image_payload,
-                    checksum=checksum,
-                )
+                try:
+                    asset = asset_repository.store_asset(
+                        user_id=user_id,
+                        document_id=document_id,
+                        mime_type=mime_type,
+                        payload=image_payload,
+                        checksum=checksum,
+                    )
+                except ValueError as exc:
+                    message = str(exc)
+                    if "asset limit" not in message:
+                        raise
+                    emit_log(
+                        logger,
+                        "Image asset limit reached; continuing with text and tables.",
+                    )
+                    module_logger.warning(
+                        "rag_ingestion_image_skipped reason=asset_limit user_id=%s document_id=%s "
+                        "error=%s context_excerpt=%s",
+                        user_id,
+                        document_id,
+                        message,
+                        chunk_text[:160],
+                    )
+                    continue
                 module_logger.info(
                     "rag_ingestion_image_stored user_id=%s document_id=%s asset_id=%s "
                     "mime_type=%s size_bytes=%s checksum_prefix=%s context_excerpt=%s",
@@ -474,6 +493,7 @@ def summarize_chunk(
         user_id=user_id,
         document_id=document_id,
         asset_repository=asset_repository,
+        logger=logger,
     )
 
     emit_log(logger, f"Types found: {content_data['types']}")

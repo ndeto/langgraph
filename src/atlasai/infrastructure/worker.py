@@ -21,6 +21,15 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 
+def terminal_ingestion_failure_message(max_attempts: int) -> str:
+    """Return the user-facing message for permanently failed ingestion jobs."""
+
+    return (
+        f"Document processing failed after {max_attempts} attempts. "
+        "Please try a smaller or simpler PDF."
+    )
+
+
 class ExpiredSessionCleanupRepository(Protocol):
     """Optional repository hook for discovering expired sessions."""
 
@@ -112,6 +121,61 @@ def enqueue_expired_session_cleanup_jobs(
     return repository.enqueue_expired_session_cleanup_jobs()
 
 
+async def fail_stale_exhausted_ingestion_job(
+    repositories: PostgresRepositoryBundle | InMemoryRepositoryBundle,
+    vector_service: PostgresVectorService,
+    *,
+    settings: WorkerSettings,
+) -> bool:
+    """Mark exhausted stale ingestion jobs failed and release their resources."""
+
+    document_service = _document_service(repositories)
+    job = document_service.repository.fail_stale_exhausted_job(
+        heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds,
+        max_attempts=settings.max_attempts,
+        text=terminal_ingestion_failure_message(settings.max_attempts),
+    )
+    if job is None:
+        return False
+
+    logger.error(
+        "worker_ingestion_exhausted job_id=%s user_id=%s document_id=%s attempts=%s",
+        job.job_id,
+        job.user_id,
+        job.document_id,
+        job.attempts,
+    )
+
+    await vector_service.adelete_by_document(
+        table_name="raggidy_docs",
+        user_id=job.user_id,
+        document_id=job.document_id,
+    )
+
+    if isinstance(repositories, PostgresRepositoryBundle) and repositories.assets is not None:
+        repositories.assets.delete_document_assets(
+            document_id=job.document_id,
+            user_id=job.user_id,
+        )
+
+    if job.source_path:
+        Path(job.source_path).unlink(missing_ok=True)
+
+    if repositories.usage is None or repositories.quotas is None:
+        raise RuntimeError("Repository bundle startup must run before use.")
+
+    repositories.usage.append_record(
+        user_id=job.user_id,
+        record=usage_record_from_callback(
+            operation="ingestion",
+            payload=None,
+            run_id=job.job_id,
+        ),
+    )
+    repositories.quotas.release_ingestion(user_id=job.user_id)
+    return True
+
+
 async def process_next_ingestion_job(
     repositories: PostgresRepositoryBundle | InMemoryRepositoryBundle,
     vector_service: PostgresVectorService,
@@ -119,6 +183,16 @@ async def process_next_ingestion_job(
     settings: WorkerSettings,
 ) -> bool:
     document_service = _document_service(repositories)
+    if repositories.quotas is None or repositories.usage is None:
+        raise RuntimeError("Repository bundle startup must run before use.")
+
+    if await fail_stale_exhausted_ingestion_job(
+        repositories,
+        vector_service,
+        settings=settings,
+    ):
+        return True
+
     job = document_service.claim_next_job(
         heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds,
         max_attempts=settings.max_attempts,
@@ -134,9 +208,6 @@ async def process_next_ingestion_job(
         job.attempts,
         job.source_path,
     )
-
-    if repositories.quotas is None or repositories.usage is None:
-        raise RuntimeError("Repository bundle startup must run before use.")
 
     asset_repository = (
         repositories.assets
@@ -229,7 +300,7 @@ async def process_next_ingestion_job(
         else:
             document_service.repository.mark_failed(
                 job_id=job.job_id,
-                text="Document processing failed.",
+                text=terminal_ingestion_failure_message(settings.max_attempts),
             )
             terminal = True
         return True

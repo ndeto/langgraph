@@ -85,6 +85,14 @@ class DocumentRepository(Protocol):
 
     def mark_retry(self, *, job_id: str, text: str) -> None: ...
 
+    def fail_stale_exhausted_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+        text: str,
+    ) -> IngestionJobRecord | None: ...
+
     def claim_next_job(
         self,
         *,
@@ -210,6 +218,35 @@ class InMemoryDocumentRepository:
                 job_id=job_id,
                 payload={"type": "processing", "text": "Retrying ingestion."},
             )
+
+    def fail_stale_exhausted_job(
+        self,
+        *,
+        heartbeat_timeout_seconds: int,
+        max_attempts: int,
+        text: str,
+    ) -> IngestionJobRecord | None:
+        with self._lock:
+            now = datetime.now(UTC)
+            stale_before = now - timedelta(seconds=heartbeat_timeout_seconds)
+            for job in self._jobs.values():
+                if job.expires_at <= now:
+                    continue
+                if (
+                    job.state == "processing"
+                    and job.heartbeat_at is not None
+                    and job.heartbeat_at < stale_before
+                    and job.attempts >= max_attempts
+                ):
+                    self._set_job_state_locked(job_id=job.job_id, state="failed")
+                    job.failure_text = text
+                    job.heartbeat_at = None
+                    self._append_event_locked(
+                        job_id=job.job_id,
+                        payload={"type": "failed", "text": text},
+                    )
+                    return job
+        return None
 
     def claim_next_job(
         self,
