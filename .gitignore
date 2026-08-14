@@ -34,3 +34,4 @@ tmp/
 
 # Vite production output
 src/atlasai/web/static/
+scripts/admin_metrics.py

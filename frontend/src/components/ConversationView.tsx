@@ -9,6 +9,7 @@ import type { ConversationMessage } from "../lib/types";
 type ConversationViewProps = {
   messages: ConversationMessage[];
   streamStage: string | null;
+  uploadNotice: { tone: "working" | "ready" | "error"; text: string } | null;
   disabled: boolean;
   onSend: (message: string) => Promise<void> | void;
   onPickFile: (file: File) => void;
@@ -19,6 +20,7 @@ type ConversationViewProps = {
 export function ConversationView({
   messages,
   streamStage,
+  uploadNotice,
   disabled,
   onSend,
   onPickFile,
@@ -32,7 +34,7 @@ export function ConversationView({
       behavior: "smooth",
       block: "end",
     });
-  }, [messages, streamStage]);
+  }, [messages, streamStage, uploadNotice]);
 
   function transformMarkdownUrl(url: string) {
     if (url.startsWith("data:image/")) {
@@ -68,6 +70,13 @@ export function ConversationView({
           {messages.length === 0 ? (
             <div className="empty-state empty-state-chat">
               <h3>Start with a question or attach a PDF first.</h3>
+            </div>
+          ) : null}
+
+          {uploadNotice ? (
+            <div className={`document-notice document-notice-${uploadNotice.tone}`} role="status">
+              <span className="status-pulse" aria-hidden="true" />
+              <span>{uploadNotice.text}</span>
             </div>
           ) : null}
 
@@ -135,7 +144,12 @@ export function ConversationView({
       <p className="conversation-note">
         This is an anonymous session. Documents are deleted after they are indexed,
         and all data expires within 24 hours. Send any concerns to{" "}
-        <a href="mailto:martin@beav3r.ai">martin@beav3r.ai</a>.
+        <a href="mailto:martin@beav3r.ai">martin@beav3r.ai</a>. Read the{" "}
+        <a href="https://medium.com/@ndeto/building-ai-agents-graph-loops-memory-retrieval-rag-bf2490930834">
+          article
+        </a>{" "}
+        or view the{" "}
+        <a href="https://github.com/ndeto/langgraph">source code</a>.
       </p>
     </div>
   );

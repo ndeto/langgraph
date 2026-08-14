@@ -181,6 +181,19 @@ async def post_thread_message(
                                 and isinstance(asset.get("asset_id"), str)
                             }.values()
                         )
+                        logger.info(
+                            "thread_stream_sources_received trace_id=%s user_id=%s "
+                            "thread_id=%s asset_count=%s asset_ids=%s",
+                            request_context.trace_id,
+                            request_context.session.session.user_id,
+                            thread.thread_id,
+                            len(assistant_assets),
+                            [
+                                asset.get("asset_id")
+                                for asset in assistant_assets
+                                if asset.get("asset_id")
+                            ],
+                        )
                 if isinstance(chunk, dict) and chunk.get("type") == "final":
                     usage_payload = extract_usage_payload(chunk.get("data"))
                     record = usage_record_from_callback(
@@ -204,6 +217,20 @@ async def post_thread_message(
                             role="assistant",
                             content="".join(assistant_text_parts).strip(),
                             assets=assistant_assets or None,
+                        )
+                        logger.info(
+                            "thread_assistant_message_persisted trace_id=%s user_id=%s "
+                            "thread_id=%s text_chars=%s asset_count=%s asset_ids=%s",
+                            request_context.trace_id,
+                            request_context.session.session.user_id,
+                            thread.thread_id,
+                            len("".join(assistant_text_parts).strip()),
+                            len(assistant_assets),
+                            [
+                                asset.get("asset_id")
+                                for asset in assistant_assets
+                                if asset.get("asset_id")
+                            ],
                         )
                     yield encode_ndjson_event(build_usage_event(record))
                     yield encode_ndjson_event(
@@ -246,6 +273,20 @@ async def post_thread_message(
                         role="assistant",
                         content="".join(assistant_text_parts).strip(),
                         assets=assistant_assets or None,
+                    )
+                    logger.info(
+                        "thread_assistant_message_persisted_missing_final trace_id=%s "
+                        "user_id=%s thread_id=%s text_chars=%s asset_count=%s asset_ids=%s",
+                        request_context.trace_id,
+                        request_context.session.session.user_id,
+                        thread.thread_id,
+                        len("".join(assistant_text_parts).strip()),
+                        len(assistant_assets),
+                        [
+                            asset.get("asset_id")
+                            for asset in assistant_assets
+                            if asset.get("asset_id")
+                        ],
                     )
                 yield encode_ndjson_event(build_usage_event(record))
                 yield encode_ndjson_event({"type": "done", "thread_id": thread.thread_id})

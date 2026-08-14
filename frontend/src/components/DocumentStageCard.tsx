@@ -40,7 +40,10 @@ export function DocumentStageCard({
     }
     return "Idle";
   }, [isProcessing, upload.status]);
-  const expiresAt = new Date(session.expiresAt).toLocaleTimeString([], {
+  const expiresAt = new Date(session.expiresAt).toLocaleString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   });
@@ -57,7 +60,6 @@ export function DocumentStageCard({
     <section className={`document-stage${open ? " document-stage-open" : ""}`}>
       <div className="card-head">
         <div>
-          <p className="panel-label">Panel</p>
           <h2>Ingestion</h2>
         </div>
         <div className="panel-head-actions">

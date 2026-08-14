@@ -66,7 +66,7 @@ export function Composer({ disabled, onSend, onPickFile }: ComposerProps) {
             type="button"
             onClick={() => fileInputRef.current?.click()}
           >
-            Attach File
+            Attach PDF
           </button>
           <button className="send-button" type="submit" disabled={disabled}>
             {disabled ? "Working" : "Send"}

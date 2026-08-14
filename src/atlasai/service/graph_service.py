@@ -33,6 +33,7 @@ from atlasai.lib.session import Context, StateContext
 from atlasai.rag.utils import (
     build_document_context_prompt,
     build_retrieved_image_assets,
+    extract_image_entries,
 )
 from atlasai.service.contracts import GraphRunner, InvokePayload
 from atlasai.store import PostgresVectorService, tool_store
@@ -45,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 SUMMARY_TRIGGER_MESSAGE_COUNT = 12
 SUMMARY_KEEP_LAST_MESSAGES = 6
+RAG_CONTEXT_CHUNK_COUNT = 4
+RAG_IMAGE_DISCOVERY_CHUNK_COUNT = 10
 
 
 class PriceInput(BaseModel):
@@ -209,12 +212,46 @@ class GraphService(GraphRunner):
             table_name="raggidy_docs",
             query=user_input,
             filter=filter_payload,
+            k=RAG_CONTEXT_CHUNK_COUNT,
+        )
+        image_rag_res = await self.vector_service.asimilarity_search(
+            table_name="raggidy_docs",
+            query=user_input,
+            filter=filter_payload,
+            k=RAG_IMAGE_DISCOVERY_CHUNK_COUNT,
         )
 
         rag_context = build_document_context_prompt(
             user_input, rag_res, "knowledge-base"
         )
-        related_image_assets = build_retrieved_image_assets(rag_res)
+        related_image_assets = build_retrieved_image_assets(image_rag_res)
+        retrieved_image_chunks = []
+        for rank, chunk in enumerate(image_rag_res, start=1):
+            metadata = getattr(chunk, "metadata", {}) or {}
+            image_entries = extract_image_entries(chunk)
+            retrieved_image_chunks.append(
+                {
+                    "rank": rank,
+                    "document_id": metadata.get("document_id"),
+                    "image_count": len(image_entries),
+                    "asset_ids": [
+                        entry.get("asset_id")
+                        for entry in image_entries
+                        if entry.get("asset_id")
+                    ],
+                }
+            )
+        logger.info(
+            "rag_retrieval_sources trace_id=%s user_id=%s query=%r retrieved_chunks=%s "
+            "image_discovery_chunks=%s selected_asset_ids=%s chunk_images=%s",
+            trace_id,
+            user_id,
+            user_input[:120],
+            len(rag_res),
+            len(image_rag_res),
+            [asset.get("asset_id") for asset in related_image_assets],
+            retrieved_image_chunks,
+        )
         runtime.stream_writer({"type": "sources", "data": related_image_assets})
 
         history = state.get("messages") or []
@@ -520,6 +557,18 @@ class GraphService(GraphRunner):
                             if isinstance(assets, list)
                             else []
                         )
+                        logger.info(
+                            "rag_stream_sources_captured trace_id=%s user_id=%s "
+                            "asset_count=%s asset_ids=%s",
+                            trace_id,
+                            user_id,
+                            len(latest_image_assets),
+                            [
+                                asset.get("asset_id")
+                                for asset in latest_image_assets
+                                if asset.get("asset_id")
+                            ],
+                        )
                 elif chunk["type"] == "messages":
                     # Stream Node Status
                     message, metadata = chunk["data"]
@@ -532,7 +581,25 @@ class GraphService(GraphRunner):
 
             if last_state is not None:
                 if latest_image_assets:
+                    logger.info(
+                        "rag_stream_sources_emitted trace_id=%s user_id=%s "
+                        "asset_count=%s asset_ids=%s",
+                        trace_id,
+                        user_id,
+                        len(latest_image_assets),
+                        [
+                            asset.get("asset_id")
+                            for asset in latest_image_assets
+                            if asset.get("asset_id")
+                        ],
+                    )
                     yield {"type": "sources", "data": latest_image_assets}
+                else:
+                    logger.info(
+                        "rag_stream_sources_empty trace_id=%s user_id=%s",
+                        trace_id,
+                        user_id,
+                    )
 
                 final_state: StateContext = last_state
                 if latest_usage_payload is not None and not last_state.get(

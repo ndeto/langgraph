@@ -1,11 +1,15 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from langchain.messages import HumanMessage
 
-from atlasai.service.graph_service import GraphService
+from atlasai.service.graph_service import (
+    GraphService,
+    RAG_CONTEXT_CHUNK_COUNT,
+    RAG_IMAGE_DISCOVERY_CHUNK_COUNT,
+)
 
 
 class TestGraphService(unittest.TestCase):
@@ -28,7 +32,9 @@ class TestGraphService(unittest.TestCase):
         self.assertEqual(config["run_name"], "atlas-main")
 
     def test_agent_llm_node_includes_thread_summary_in_system_prompt(self):
-        vector_service = SimpleNamespace(asimilarity_search=AsyncMock(return_value=[]))
+        vector_service = SimpleNamespace(
+            asimilarity_search=AsyncMock(return_value=[]),
+        )
         tool_retriever = SimpleNamespace(as_retriever=lambda **_: SimpleNamespace())
         llm_response = SimpleNamespace(
             tool_calls=[],
@@ -103,7 +109,9 @@ class TestGraphService(unittest.TestCase):
         self.assertIn("User is building Atlas Chat.", system_message.content)
 
     def test_agent_llm_node_filters_rag_search_by_user_id(self):
-        vector_service = SimpleNamespace(asimilarity_search=AsyncMock(return_value=[]))
+        vector_service = SimpleNamespace(
+            asimilarity_search=AsyncMock(return_value=[]),
+        )
         tool_retriever = SimpleNamespace(as_retriever=lambda **_: SimpleNamespace())
         streamed_events: list[dict] = []
         image_assets = [{"asset_id": "asset-1", "mime_type": "image/png"}]
@@ -166,10 +174,21 @@ class TestGraphService(unittest.TestCase):
                 )
             )
 
-        vector_service.asimilarity_search.assert_awaited_once_with(
-            table_name="raggidy_docs",
-            query="Hello",
-            filter={"user_id": "user-42"},
+        vector_service.asimilarity_search.assert_has_awaits(
+            [
+                call(
+                    table_name="raggidy_docs",
+                    query="Hello",
+                    filter={"user_id": "user-42"},
+                    k=RAG_CONTEXT_CHUNK_COUNT,
+                ),
+                call(
+                    table_name="raggidy_docs",
+                    query="Hello",
+                    filter={"user_id": "user-42"},
+                    k=RAG_IMAGE_DISCOVERY_CHUNK_COUNT,
+                ),
+            ]
         )
         self.assertEqual(result["messages"], [llm_response])
         self.assertNotIn("selected_image_assets", result)
@@ -190,7 +209,9 @@ class TestGraphService(unittest.TestCase):
         )
 
     def test_agent_llm_node_filters_rag_search_by_user_even_with_document_id(self):
-        vector_service = SimpleNamespace(asimilarity_search=AsyncMock(return_value=[]))
+        vector_service = SimpleNamespace(
+            asimilarity_search=AsyncMock(return_value=[]),
+        )
         tool_retriever = SimpleNamespace(as_retriever=lambda **_: SimpleNamespace())
         llm_response = SimpleNamespace(
             tool_calls=[],
@@ -252,10 +273,21 @@ class TestGraphService(unittest.TestCase):
                 )
             )
 
-        vector_service.asimilarity_search.assert_awaited_once_with(
-            table_name="raggidy_docs",
-            query="Hello",
-            filter={"user_id": "user-42"},
+        vector_service.asimilarity_search.assert_has_awaits(
+            [
+                call(
+                    table_name="raggidy_docs",
+                    query="Hello",
+                    filter={"user_id": "user-42"},
+                    k=RAG_CONTEXT_CHUNK_COUNT,
+                ),
+                call(
+                    table_name="raggidy_docs",
+                    query="Hello",
+                    filter={"user_id": "user-42"},
+                    k=RAG_IMAGE_DISCOVERY_CHUNK_COUNT,
+                ),
+            ]
         )
 
     def test_stream_keeps_image_assets_local_to_each_run(self):

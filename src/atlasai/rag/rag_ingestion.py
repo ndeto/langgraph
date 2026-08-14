@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -27,6 +28,7 @@ from atlasai.rag.image_payloads import (
 from atlasai.store.hybrid_store import PostgresVectorService
 
 config: SysConfig = bootstrap_config()
+module_logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -119,7 +121,20 @@ def partition_pdf_doc(
         )
         raise
 
-    emit_log(logger, f"Found {len(elements)} elements")
+    emit_log(logger, f"Partitioned {len(elements)} elements")
+    element_counts: dict[str, int] = {}
+    for element in elements:
+        element_type = type(element).__name__
+        element_counts[element_type] = element_counts.get(element_type, 0) + 1
+    emit_log(
+        logger,
+        (
+            "Element types: "
+            f"{element_counts.get('Image', 0)} images, "
+            f"{element_counts.get('Table', 0)} tables, "
+            f"{len(elements) - element_counts.get('Image', 0) - element_counts.get('Table', 0)} other"
+        ),
+    )
     return elements
 
 
@@ -316,11 +331,26 @@ def separate_content_types(
             if element_type == "Image":
                 content_data["types"].append("image")
                 if asset_repository is None or user_id is None or document_id is None:
+                    module_logger.warning(
+                        "rag_ingestion_image_skipped reason=missing_asset_context user_id=%s document_id=%s "
+                        "has_asset_repository=%s context_excerpt=%s",
+                        user_id,
+                        document_id,
+                        asset_repository is not None,
+                        chunk_text[:160],
+                    )
                     continue
                 image_payload = decode_base64_image(
                     getattr(element.metadata, "image_base64", None)
                 )
                 if image_payload is None:
+                    module_logger.warning(
+                        "rag_ingestion_image_skipped reason=decode_failed user_id=%s document_id=%s "
+                        "context_excerpt=%s",
+                        user_id,
+                        document_id,
+                        chunk_text[:160],
+                    )
                     continue
                 mime_type = getattr(element.metadata, "image_mime_type", None)
                 if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
@@ -332,6 +362,17 @@ def separate_content_types(
                     mime_type=mime_type,
                     payload=image_payload,
                     checksum=checksum,
+                )
+                module_logger.info(
+                    "rag_ingestion_image_stored user_id=%s document_id=%s asset_id=%s "
+                    "mime_type=%s size_bytes=%s checksum_prefix=%s context_excerpt=%s",
+                    user_id,
+                    document_id,
+                    asset.asset_id,
+                    asset.mime_type,
+                    asset.size_bytes,
+                    asset.checksum[:12],
+                    chunk_text[:160],
                 )
                 content_data["images"].append(
                     build_image_entry(
@@ -440,8 +481,24 @@ def summarize_chunk(
         logger,
         f"Tables: {len(content_data['tables'])}, Images: {len(content_data['images'])}",
     )
+    if content_data["images"]:
+        image_asset_ids = [
+            str(image.get("asset_id"))
+            for image in content_data["images"]
+            if isinstance(image, dict) and image.get("asset_id")
+        ]
+        emit_log(logger, f"Stored image assets: {', '.join(image_asset_ids)}")
+        module_logger.info(
+            "rag_ingestion_chunk_images user_id=%s document_id=%s chunk=%s/%s image_count=%s asset_ids=%s",
+            user_id,
+            document_id,
+            current_chunk,
+            total_chunks,
+            len(image_asset_ids),
+            image_asset_ids,
+        )
 
-    emit_log(logger, "Creating AI enhance summary")
+    emit_log(logger, "Creating searchable summary")
     tables = content_data.get("tables")
     images = content_data.get("images")
     texts = content_data.get("text") or ""
@@ -452,7 +509,7 @@ def summarize_chunk(
             emit_log(logger, f"AI summary failed: {e}")
             enhanced_content = content_data.get("text")
     else:
-        emit_log(logger, "Using raw text, no images and tables found")
+        emit_log(logger, "Using raw text; no images or tables found")
         enhanced_content = content_data["text"] or ""
 
     metadata = {
@@ -586,7 +643,7 @@ async def stream_ingest_pdf(
             yield event_queue.pop(0)
         await asyncio.sleep(0)
 
-    emit_log(logger, f"Storing {len(docs)} docs in {store_name}")
+    emit_log(logger, f"Indexing {len(docs)} chunks")
     await storage.aadd_documents(docs)
     emit_log(logger, f"Ingestion complete for {resolved_name}")
     emit_stats(

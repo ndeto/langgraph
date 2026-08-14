@@ -43,6 +43,40 @@ function App() {
     () => upload.state.document ?? localDocument ?? sessionData?.activeDocument ?? null,
     [localDocument, sessionData?.activeDocument, upload.state.document],
   );
+  const uploadNotice = useMemo(() => {
+    const fileName = upload.state.fileName ?? upload.state.document?.name ?? "your PDF";
+
+    switch (upload.state.status) {
+      case "validating":
+      case "uploading":
+        return {
+          tone: "working" as const,
+          text: `Uploading ${fileName}.`,
+        };
+      case "processing":
+        return {
+          tone: "working" as const,
+          text: `${fileName} is processing. You can ask once indexing finishes.`,
+        };
+      case "ready":
+        return {
+          tone: "ready" as const,
+          text: `${fileName} processed. You can ask questions about it now.`,
+        };
+      case "error":
+        return {
+          tone: "error" as const,
+          text: upload.state.errorMessage ?? `${fileName} could not be processed.`,
+        };
+      default:
+        return null;
+    }
+  }, [
+    upload.state.document?.name,
+    upload.state.errorMessage,
+    upload.state.fileName,
+    upload.state.status,
+  ]);
   const showPanel = isPanelOpen;
 
   function handlePickFile(file: File) {
@@ -129,6 +163,7 @@ function App() {
           <ConversationView
             messages={conversation.messages}
             streamStage={conversation.streamStage}
+            uploadNotice={uploadNotice}
             disabled={conversation.isStreaming}
             onSend={conversation.sendMessage}
             onPickFile={handlePickFile}

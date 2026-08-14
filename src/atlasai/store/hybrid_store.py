@@ -25,6 +25,8 @@ class PostgresVectorService:
         self.table_names = tuple(dict.fromkeys(table_names or DEFAULT_VECTOR_TABLES))
         self.hybrid_search_config = HybridSearchConfig(
             tsv_column="hybrid_text",
+            primary_top_k=20,
+            secondary_top_k=20,
             fusion_function=reciprocal_rank_fusion,
             fusion_function_parameters={"rrf_k": 60, "fetch_top_k": 10},
         )
